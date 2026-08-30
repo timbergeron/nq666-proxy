@@ -69,7 +69,7 @@ static nq_socket_t bind_loopback(uint16_t *port)
     }
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_addr.s_addr = htonl(UINT32_C(0x7f000001));
     address.sin_port = 0;
     if (nq_socket_bind(fd, (struct sockaddr *)&address,
                        (nq_socklen_t)sizeof(address)) != 0 ||
@@ -215,7 +215,7 @@ int main(void)
     CHECK(client_fd != NQ_INVALID_SOCKET);
     memset(&proxy_address, 0, sizeof(proxy_address));
     proxy_address.sin_family = AF_INET;
-    proxy_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    proxy_address.sin_addr.s_addr = htonl(UINT32_C(0x7f000001));
     proxy_address.sin_port = htons(proxy_port);
 
     /* Server-browser requests must return the public proxy address. */
