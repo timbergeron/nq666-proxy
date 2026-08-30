@@ -30,7 +30,7 @@ jobs:
           make clean all check
           CFLAGS="-O2 -arch arm64 -arch x86_64 -mmacosx-version-min=11.0"
       - name: Verify universal architectures
-        run: lipo -verify_arch arm64 x86_64 nq666-proxy
+        run: lipo nq666-proxy -verify_arch arm64 x86_64
       - name: Package universal binary
         run: >-
           tar -czf nq666-proxy-macos-universal.tar.gz
