@@ -1,5 +1,7 @@
 # nq666-proxy
 
+[Open the visual setup and operations guide](https://raw.githack.com/timbergeron/nq666-proxy/main/docs/index.html)
+
 [![CI](https://github.com/timbergeron/nq666-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/timbergeron/nq666-proxy/actions/workflows/ci.yml)
 
 `nq666-proxy` is a small, stateful UDP gateway for Linux, macOS, and Windows
@@ -23,6 +25,7 @@ channel independently on each side and translates the gameplay payloads:
 
 - `src/` contains the proxy implementation and its internal headers.
 - `tests/` contains the unit and process integration test programs.
+- `docs/` contains the self-contained visual setup and operations guide.
 - `packaging/systemd/` contains the Linux service and default configuration.
 - `.github/workflows/` contains the cross-platform CI and artifact builds.
 

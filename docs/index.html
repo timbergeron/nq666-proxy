@@ -1,0 +1,1419 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A visual setup and operations guide for nq666-proxy, the cross-platform NetQuake protocol 15 to QSS-M protocol 666 gateway.">
+  <meta name="color-scheme" content="light dark">
+  <meta property="og:title" content="nq666-proxy — Legacy Quake, thoughtfully connected">
+  <meta property="og:description" content="Build, deploy, and operate the protocol gateway for original WinQuake and ProQuake clients.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://raw.githack.com/timbergeron/nq666-proxy/main/docs/index.html">
+  <link rel="canonical" href="https://raw.githack.com/timbergeron/nq666-proxy/main/docs/index.html">
+  <title>nq666-proxy — Setup &amp; Operations Guide</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: #f4f5f7;
+      --surface: rgba(255, 255, 255, 0.82);
+      --surface-solid: #ffffff;
+      --surface-raised: #f9fafb;
+      --ink: #111318;
+      --muted: #626772;
+      --line: rgba(17, 19, 24, 0.11);
+      --line-strong: rgba(17, 19, 24, 0.2);
+      --accent: #6e46ff;
+      --accent-strong: #5732df;
+      --accent-soft: rgba(110, 70, 255, 0.11);
+      --green: #158462;
+      --green-soft: rgba(21, 132, 98, 0.11);
+      --amber: #a96700;
+      --code: #101217;
+      --code-ink: #eef0f7;
+      --shadow: 0 24px 70px rgba(31, 34, 46, 0.1);
+      --radius-xl: 30px;
+      --radius-lg: 22px;
+      --radius-md: 15px;
+      --max: 1160px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #0c0e12;
+        --surface: rgba(23, 25, 31, 0.82);
+        --surface-solid: #17191f;
+        --surface-raised: #1c1f26;
+        --ink: #f6f7fb;
+        --muted: #a3a8b4;
+        --line: rgba(255, 255, 255, 0.11);
+        --line-strong: rgba(255, 255, 255, 0.2);
+        --accent: #9b82ff;
+        --accent-strong: #b1a0ff;
+        --accent-soft: rgba(155, 130, 255, 0.14);
+        --green: #5ad0aa;
+        --green-soft: rgba(90, 208, 170, 0.12);
+        --amber: #f2b85b;
+        --code: #08090c;
+        --code-ink: #f3f4f8;
+        --shadow: 0 28px 80px rgba(0, 0, 0, 0.34);
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 82% 4%, var(--accent-soft), transparent 28rem),
+        radial-gradient(circle at 8% 34%, var(--green-soft), transparent 24rem),
+        var(--page);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 17px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    a {
+      color: inherit;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 0.2em;
+    }
+
+    button,
+    a {
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    :focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 3px;
+    }
+
+    .skip-link {
+      position: fixed;
+      z-index: 100;
+      top: 12px;
+      left: 12px;
+      transform: translateY(-150%);
+      border-radius: 10px;
+      background: var(--ink);
+      color: var(--page);
+      padding: 10px 14px;
+    }
+
+    .skip-link:focus {
+      transform: translateY(0);
+    }
+
+    .shell {
+      width: min(calc(100% - 40px), var(--max));
+      margin: 0 auto;
+    }
+
+    .site-header {
+      position: sticky;
+      z-index: 50;
+      top: 0;
+      border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--page) 78%, transparent);
+      backdrop-filter: blur(18px) saturate(150%);
+      -webkit-backdrop-filter: blur(18px) saturate(150%);
+    }
+
+    .nav {
+      min-height: 68px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 11px;
+      color: var(--ink);
+      font-size: 15px;
+      font-weight: 750;
+      letter-spacing: -0.01em;
+      text-decoration: none;
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: var(--surface-solid);
+      box-shadow: 0 8px 24px rgba(23, 25, 31, 0.08);
+      font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: -0.05em;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      font-size: 14px;
+      font-weight: 650;
+    }
+
+    .nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+    }
+
+    .nav-links a:hover {
+      color: var(--ink);
+    }
+
+    .nav-links .github-link {
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      color: var(--ink);
+      padding: 8px 14px;
+    }
+
+    main {
+      overflow: hidden;
+    }
+
+    .hero {
+      padding: 108px 0 78px;
+      text-align: center;
+    }
+
+    .eyebrow {
+      margin: 0 0 22px;
+      color: var(--accent-strong);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      max-width: 920px;
+      margin: 0 auto;
+      font-size: clamp(3.25rem, 8vw, 6.9rem);
+      font-weight: 780;
+      letter-spacing: -0.068em;
+      line-height: 0.94;
+    }
+
+    .hero-copy {
+      max-width: 720px;
+      margin: 32px auto 0;
+      color: var(--muted);
+      font-size: clamp(1.08rem, 2vw, 1.34rem);
+      line-height: 1.52;
+    }
+
+    .hero-actions {
+      margin-top: 36px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+    }
+
+    .button {
+      min-height: 48px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      padding: 11px 20px;
+      font-size: 15px;
+      font-weight: 720;
+      text-decoration: none;
+      transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+    }
+
+    .button:hover {
+      transform: translateY(-1px);
+    }
+
+    .button-primary {
+      background: var(--ink);
+      color: var(--page);
+      box-shadow: 0 12px 30px rgba(17, 19, 24, 0.18);
+    }
+
+    .button-secondary {
+      border-color: var(--line-strong);
+      background: var(--surface);
+      color: var(--ink);
+    }
+
+    .platforms {
+      margin-top: 35px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 9px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--muted);
+      padding: 7px 12px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .chip::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      content: "";
+      box-shadow: 0 0 0 4px var(--green-soft);
+    }
+
+    .signal-card {
+      position: relative;
+      margin-top: 78px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      text-align: left;
+    }
+
+    .signal-card::before {
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(90deg, transparent 49.9%, var(--line) 50%, transparent 50.1%),
+        linear-gradient(0deg, transparent 49.9%, var(--line) 50%, transparent 50.1%);
+      background-size: 64px 64px;
+      content: "";
+      opacity: 0.45;
+      pointer-events: none;
+    }
+
+    .signal-flow {
+      position: relative;
+      min-height: 310px;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: center;
+      gap: 20px;
+      padding: 54px;
+    }
+
+    .node {
+      min-height: 150px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-lg);
+      background: var(--surface-solid);
+      padding: 22px;
+    }
+
+    .node-proxy {
+      border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+      box-shadow: 0 18px 45px var(--accent-soft);
+    }
+
+    .node-label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+    }
+
+    .node strong {
+      display: block;
+      margin: 17px 0 5px;
+      font-size: 19px;
+      line-height: 1.2;
+    }
+
+    .node small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .protocol {
+      margin-top: 18px;
+      color: var(--accent-strong);
+      font: 750 13px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .flow-arrow {
+      color: var(--muted);
+      font-size: 24px;
+      font-weight: 300;
+    }
+
+    section {
+      padding: 94px 0;
+    }
+
+    .section-kicker {
+      margin-bottom: 12px;
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+
+    h2 {
+      max-width: 800px;
+      margin-bottom: 20px;
+      font-size: clamp(2.25rem, 5vw, 4.4rem);
+      font-weight: 760;
+      letter-spacing: -0.052em;
+      line-height: 1.02;
+    }
+
+    .section-intro {
+      max-width: 690px;
+      margin-bottom: 48px;
+      color: var(--muted);
+      font-size: 19px;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .feature {
+      min-height: 250px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      padding: 28px;
+    }
+
+    .feature-number {
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      border-radius: 12px;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      font: 800 13px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .feature h3 {
+      margin: 52px 0 10px;
+      font-size: 20px;
+      letter-spacing: -0.025em;
+    }
+
+    .feature p {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .quick-start {
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--surface-solid) 45%, transparent);
+    }
+
+    .step-list {
+      display: grid;
+      gap: 18px;
+      counter-reset: steps;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 64px minmax(0, 1fr);
+      gap: 22px;
+      counter-increment: steps;
+    }
+
+    .step::before {
+      width: 48px;
+      height: 48px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      background: var(--surface-solid);
+      color: var(--muted);
+      content: counter(steps, decimal-leading-zero);
+      font: 750 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .step-body {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface-solid);
+      padding: 28px;
+    }
+
+    .step h3 {
+      margin-bottom: 8px;
+      font-size: 23px;
+      letter-spacing: -0.03em;
+    }
+
+    .step-copy {
+      margin-bottom: 20px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .tabs {
+      width: fit-content;
+      display: flex;
+      gap: 4px;
+      margin-bottom: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface-raised);
+      padding: 4px;
+    }
+
+    .tab {
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 7px 11px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.3;
+    }
+
+    .tab[aria-selected="true"] {
+      background: var(--surface-solid);
+      color: var(--ink);
+      box-shadow: 0 3px 12px rgba(0, 0, 0, 0.08);
+    }
+
+    .code-wrap {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      border-radius: var(--radius-md);
+      background: var(--code);
+    }
+
+    pre {
+      margin: 0;
+      overflow-x: auto;
+      padding: 22px 68px 22px 22px;
+      color: var(--code-ink);
+      font: 500 13.5px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      tab-size: 2;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    :not(pre) > code {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-raised);
+      padding: 0.12em 0.38em;
+      color: var(--ink);
+      font-size: 0.88em;
+    }
+
+    .copy-button {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.08);
+      color: #d8dbe5;
+      cursor: pointer;
+      padding: 7px 9px;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .copy-button:hover {
+      background: rgba(255, 255, 255, 0.14);
+    }
+
+    .network-card {
+      display: grid;
+      grid-template-columns: 1.12fr 0.88fr;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      background: var(--surface-solid);
+      box-shadow: var(--shadow);
+    }
+
+    .network-visual {
+      min-height: 430px;
+      display: grid;
+      align-content: center;
+      gap: 18px;
+      background:
+        linear-gradient(145deg, var(--accent-soft), transparent 62%),
+        var(--surface-raised);
+      padding: 42px;
+    }
+
+    .route {
+      display: grid;
+      grid-template-columns: 12px 1fr auto;
+      align-items: center;
+      gap: 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface-solid);
+      padding: 16px 18px;
+    }
+
+    .route-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 0 5px var(--green-soft);
+    }
+
+    .route-private .route-dot {
+      background: var(--accent);
+      box-shadow: 0 0 0 5px var(--accent-soft);
+    }
+
+    .route strong,
+    .route small {
+      display: block;
+    }
+
+    .route small {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .route code {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .network-copy {
+      padding: 46px;
+    }
+
+    .network-copy h3 {
+      margin-bottom: 14px;
+      font-size: 28px;
+      letter-spacing: -0.035em;
+    }
+
+    .network-copy > p {
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .check-list {
+      display: grid;
+      gap: 15px;
+      margin: 28px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .check-list li {
+      position: relative;
+      padding-left: 30px;
+      font-size: 15px;
+    }
+
+    .check-list li::before {
+      position: absolute;
+      top: 0.35em;
+      left: 2px;
+      width: 15px;
+      height: 15px;
+      border: 1px solid color-mix(in srgb, var(--green) 65%, transparent);
+      border-radius: 50%;
+      color: var(--green);
+      content: "✓";
+      font-family: inherit;
+      font-size: 10px;
+      font-weight: 800;
+      line-height: 13px;
+      text-align: center;
+    }
+
+    .deployment-grid {
+      margin-top: 20px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .note {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      padding: 28px;
+    }
+
+    .note h3 {
+      margin-bottom: 10px;
+      font-size: 20px;
+      letter-spacing: -0.025em;
+    }
+
+    .note p {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .note-warning {
+      border-color: color-mix(in srgb, var(--amber) 35%, var(--line));
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface-solid);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 17px 20px;
+      vertical-align: top;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    td {
+      font-size: 14px;
+    }
+
+    td strong {
+      font-size: 15px;
+    }
+
+    .limit {
+      color: var(--accent-strong);
+      font: 750 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: nowrap;
+    }
+
+    .scope-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .scope-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      padding: 30px;
+    }
+
+    .scope-card h3 {
+      margin-bottom: 20px;
+      font-size: 22px;
+      letter-spacing: -0.03em;
+    }
+
+    .scope-card ul {
+      display: grid;
+      gap: 12px;
+      margin: 0;
+      padding-left: 20px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .cli-table td:first-child {
+      width: 30%;
+      color: var(--accent-strong);
+      font: 700 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: nowrap;
+    }
+
+    .closing {
+      padding-top: 55px;
+      text-align: center;
+    }
+
+    .closing-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      background:
+        radial-gradient(circle at 50% 0, var(--accent-soft), transparent 55%),
+        var(--surface-solid);
+      padding: 78px 28px;
+      box-shadow: var(--shadow);
+    }
+
+    .closing h2 {
+      margin-right: auto;
+      margin-left: auto;
+    }
+
+    .closing p {
+      max-width: 610px;
+      margin: 0 auto 30px;
+      color: var(--muted);
+    }
+
+    footer {
+      padding: 52px 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .footer-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      border-top: 1px solid var(--line);
+      padding-top: 28px;
+    }
+
+    .footer-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+    }
+
+    .footer-links a {
+      text-decoration: none;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    @media (max-width: 900px) {
+      .signal-flow {
+        grid-template-columns: 1fr;
+        padding: 32px;
+      }
+
+      .flow-arrow {
+        transform: rotate(90deg);
+        text-align: center;
+      }
+
+      .node {
+        min-height: 125px;
+      }
+
+      .feature-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .feature {
+        min-height: 0;
+      }
+
+      .feature h3 {
+        margin-top: 28px;
+      }
+
+      .network-card {
+        grid-template-columns: 1fr;
+      }
+
+      .network-visual {
+        min-height: 0;
+      }
+    }
+
+    @media (max-width: 680px) {
+      body {
+        font-size: 16px;
+      }
+
+      .shell {
+        width: min(calc(100% - 28px), var(--max));
+      }
+
+      .nav {
+        min-height: 60px;
+      }
+
+      .nav-links a:not(.github-link) {
+        display: none;
+      }
+
+      .hero {
+        padding: 78px 0 58px;
+      }
+
+      h1 {
+        font-size: clamp(3.1rem, 16vw, 4.6rem);
+      }
+
+      .hero-copy {
+        margin-top: 25px;
+      }
+
+      .signal-card {
+        margin-top: 52px;
+      }
+
+      .signal-flow,
+      .network-visual,
+      .network-copy {
+        padding: 24px;
+      }
+
+      section {
+        padding: 70px 0;
+      }
+
+      .step {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+
+      .step::before {
+        width: 40px;
+        height: 40px;
+      }
+
+      .step-body {
+        padding: 22px;
+      }
+
+      .tabs {
+        width: 100%;
+      }
+
+      .tab {
+        flex: 1;
+      }
+
+      .deployment-grid,
+      .scope-grid {
+        grid-template-columns: 1fr;
+      }
+
+      th,
+      td {
+        padding: 14px;
+      }
+
+      .cli-table td:first-child {
+        white-space: normal;
+      }
+
+      .footer-row {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to guide</a>
+
+  <header class="site-header">
+    <nav class="nav shell" aria-label="Primary navigation">
+      <a class="brand" href="#top" aria-label="nq666-proxy home">
+        <span class="brand-mark" aria-hidden="true">15→666</span>
+        <span>nq666-proxy</span>
+      </a>
+      <div class="nav-links">
+        <a href="#quick-start">Quick start</a>
+        <a href="#deploy">Deploy</a>
+        <a href="#limits">Limits</a>
+        <a class="github-link" href="https://github.com/timbergeron/nq666-proxy">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="content">
+    <div id="top" class="hero shell">
+      <p class="eyebrow">Legacy Quake, thoughtfully connected</p>
+      <h1>Old clients.<br>Modern server.</h1>
+      <p class="hero-copy">
+        A small, stateful UDP gateway that lets original WinQuake and ProQuake
+        clients join a QSS-M protocol 666 server—without changing either end.
+      </p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="#quick-start">Get running</a>
+        <a class="button button-secondary" href="https://github.com/timbergeron/nq666-proxy/actions/workflows/ci.yml">Download builds</a>
+      </div>
+      <div class="platforms" aria-label="Supported platforms">
+        <span class="chip">Linux</span>
+        <span class="chip">macOS Universal</span>
+        <span class="chip">Windows x86-64</span>
+      </div>
+
+      <div class="signal-card" role="img" aria-label="Protocol translation flow">
+        <div class="signal-flow">
+          <div class="node">
+            <div>
+              <span class="node-label">Legacy client</span>
+              <strong>WinQuake or ProQuake</strong>
+              <small>Original network behavior preserved</small>
+            </div>
+            <span class="protocol">protocol 15</span>
+          </div>
+          <span class="flow-arrow" aria-hidden="true">→</span>
+          <div class="node node-proxy">
+            <div>
+              <span class="node-label">Gateway</span>
+              <strong>nq666-proxy</strong>
+              <small>Reliable UDP terminated on both sides</small>
+            </div>
+            <span class="protocol">translate + reframe</span>
+          </div>
+          <span class="flow-arrow" aria-hidden="true">→</span>
+          <div class="node">
+            <div>
+              <span class="node-label">Upstream server</span>
+              <strong>QSS-M</strong>
+              <small>Base-666 or compatible FTE+666 session</small>
+            </div>
+            <span class="protocol">protocol 666</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <section id="overview">
+      <div class="shell">
+        <p class="section-kicker">Designed for one job</p>
+        <h2>A gateway, not a port forwarder.</h2>
+        <p class="section-intro">
+          Each side gets its own reliable NetQuake channel. The proxy translates
+          gameplay messages deliberately, enforces original client limits, and
+          keeps unsupported extensions out of the session.
+        </p>
+        <div class="feature-grid">
+          <article class="feature">
+            <span class="feature-number">01</span>
+            <h3>Translate precisely</h3>
+            <p>Protocol 666 server info, entities, baselines, client data, and sounds are reduced to protocol 15 forms.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">02</span>
+            <h3>Respect the wire</h3>
+            <p>Reliable messages are reassembled, acknowledged, and refragmented for the legacy 1024-byte datagram limit.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">03</span>
+            <h3>Stay intentionally small</h3>
+            <p>IPv4 UDP, no runtime dependencies, bounded sessions, strict packet validation, and a hardened systemd unit.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="quick-start" class="quick-start">
+      <div class="shell">
+        <p class="section-kicker">Quick start</p>
+        <h2>Three steps. One legacy entrance.</h2>
+        <p class="section-intro">
+          Keep QSS-M private on UDP 26000 and expose the proxy on UDP 26001.
+          The commands below are a complete working baseline.
+        </p>
+
+        <div class="step-list">
+          <article class="step">
+            <div class="step-body">
+              <h3>Build and verify</h3>
+              <p class="step-copy">Use a C11 compiler. Windows builds run inside an MSYS2 UCRT64 shell.</p>
+              <div class="tabs" role="tablist" aria-label="Build platform">
+                <button class="tab" id="tab-posix" type="button" role="tab" aria-selected="true" aria-controls="panel-posix">Linux / macOS</button>
+                <button class="tab" id="tab-windows" type="button" role="tab" aria-selected="false" aria-controls="panel-windows" tabindex="-1">Windows</button>
+              </div>
+              <div id="panel-posix" role="tabpanel" aria-labelledby="tab-posix">
+                <div class="code-wrap">
+                  <pre><code>git clone https://github.com/timbergeron/nq666-proxy.git
+cd nq666-proxy
+make
+make check</code></pre>
+                  <button class="copy-button" type="button" data-copy aria-label="Copy Linux and macOS build commands">Copy</button>
+                </div>
+              </div>
+              <div id="panel-windows" role="tabpanel" aria-labelledby="tab-windows" hidden>
+                <div class="code-wrap">
+                  <pre><code># In an MSYS2 UCRT64 shell
+pacman -S --needed make mingw-w64-ucrt-x86_64-gcc
+git clone https://github.com/timbergeron/nq666-proxy.git
+cd nq666-proxy
+make
+make check</code></pre>
+                  <button class="copy-button" type="button" data-copy aria-label="Copy Windows build commands">Copy</button>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-body">
+              <h3>Start the gateway</h3>
+              <p class="step-copy">Replace the example public IP. Omit <code>--advertise</code> only when every player connects directly.</p>
+              <div class="code-wrap">
+                <pre><code>./nq666-proxy \
+  --server 127.0.0.1:26000 \
+  --listen 0.0.0.0:26001 \
+  --advertise 203.0.113.10:26001 \
+  --verbose</code></pre>
+                <button class="copy-button" type="button" data-copy aria-label="Copy gateway command">Copy</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-body">
+              <h3>Connect the client</h3>
+              <p class="step-copy">Open UDP 26001 in the firewall. Original clients connect to the proxy, never the private QSS-M endpoint.</p>
+              <div class="code-wrap">
+                <pre><code>connect 203.0.113.10:26001</code></pre>
+                <button class="copy-button" type="button" data-copy aria-label="Copy client command">Copy</button>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="deploy">
+      <div class="shell">
+        <p class="section-kicker">Deployment</p>
+        <h2>Expose the edge. Protect the server.</h2>
+        <p class="section-intro">
+          The cleanest deployment keeps QSS-M and the proxy on the same host.
+          Only the legacy-facing UDP listener needs to be public.
+        </p>
+
+        <div class="network-card">
+          <div class="network-visual" role="img" aria-label="Recommended network topology">
+            <div class="route">
+              <span class="route-dot" aria-hidden="true"></span>
+              <div>
+                <strong>Public legacy entrance</strong>
+                <small>WinQuake and ProQuake clients</small>
+              </div>
+              <code>UDP :26001</code>
+            </div>
+            <div class="route route-private">
+              <span class="route-dot" aria-hidden="true"></span>
+              <div>
+                <strong>nq666-proxy</strong>
+                <small>Translation and session boundary</small>
+              </div>
+              <code>0.0.0.0:26001</code>
+            </div>
+            <div class="route route-private">
+              <span class="route-dot" aria-hidden="true"></span>
+              <div>
+                <strong>Private QSS-M upstream</strong>
+                <small>Base-666 or FTE+666</small>
+              </div>
+              <code>127.0.0.1:26000</code>
+            </div>
+          </div>
+          <div class="network-copy">
+            <h3>Recommended boundary</h3>
+            <p>Keep the upstream on loopback unless modern clients also need direct access. If both generations play, expose two distinct UDP ports.</p>
+            <ul class="check-list">
+              <li>Allow the proxy port as UDP, not TCP.</li>
+              <li>Use <code>--advertise</code> for server-browser connects.</li>
+              <li>Start with verbose logging before daemonizing.</li>
+              <li>Apply normal VPS UDP filtering and rate limits.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="deployment-grid">
+          <article class="note">
+            <h3>Install with systemd</h3>
+            <p>Run <code>sudo make install</code>, copy the provided default file to <code>/etc/default/nq666-proxy</code>, edit <code>NQ666_ARGS</code>, then enable the service.</p>
+          </article>
+          <article class="note note-warning">
+            <h3>Know the trust boundary</h3>
+            <p>RCON is deliberately not relayed. QSS-M sees the proxy host and a unique source port—not the original player IP. This is compatibility infrastructure, not a DDoS filter.</p>
+          </article>
+        </div>
+
+        <div class="code-wrap" style="margin-top: 18px">
+          <pre><code>sudo make install
+sudo install -m 0644 \
+  /usr/local/share/doc/nq666-proxy/nq666-proxy.default \
+  /etc/default/nq666-proxy
+sudo editor /etc/default/nq666-proxy
+sudo systemctl daemon-reload
+sudo systemctl enable --now nq666-proxy
+sudo systemctl status nq666-proxy</code></pre>
+          <button class="copy-button" type="button" data-copy aria-label="Copy systemd installation commands">Copy</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="limits" class="quick-start">
+      <div class="shell">
+        <p class="section-kicker">Compatibility envelope</p>
+        <h2>Faithful to the original limits.</h2>
+        <p class="section-intro">
+          Translation cannot enlarge a 1996 client’s internal tables. Resources
+          beyond these limits are safely hidden, omitted, or rendered without a model.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Resource</th>
+                <th scope="col">Legacy-facing limit</th>
+                <th scope="col">Behavior above the limit</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Scoreboard slots</strong></td>
+                <td class="limit">16</td>
+                <td>Additional scoreboard updates are hidden.</td>
+              </tr>
+              <tr>
+                <td><strong>Models</strong></td>
+                <td class="limit">255 precaches</td>
+                <td>Higher model indices render as no model.</td>
+              </tr>
+              <tr>
+                <td><strong>Sounds</strong></td>
+                <td class="limit">255 precaches</td>
+                <td>Higher sound events are omitted.</td>
+              </tr>
+              <tr>
+                <td><strong>Dynamic entities</strong></td>
+                <td class="limit">600 WQ / 2048 PQ</td>
+                <td>Higher entity updates are omitted.</td>
+              </tr>
+              <tr>
+                <td><strong>Static entities</strong></td>
+                <td class="limit">128</td>
+                <td>Additional static entities are omitted.</td>
+              </tr>
+              <tr>
+                <td><strong>Light styles</strong></td>
+                <td class="limit">64</td>
+                <td>Higher style updates are omitted.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="scope-grid" style="margin-top: 18px">
+          <article class="scope-card">
+            <h3>In scope</h3>
+            <ul>
+              <li>Base protocol 666 to protocol 15 translation</li>
+              <li>WinQuake 8-bit and ProQuake 16-bit movement angles</li>
+              <li>Reliable fragment reassembly and refragmentation</li>
+              <li>Server-browser queries with address rewriting</li>
+              <li>Standard Quake and similarly sized multiplayer maps</li>
+            </ul>
+          </article>
+          <article class="scope-card">
+            <h3>Deliberately out of scope</h3>
+            <ul>
+              <li>FTE replacement deltas and CSQC</li>
+              <li>Downloads and voice transport</li>
+              <li>RMQ protocol 999 and DarkPlaces protocols</li>
+              <li>IPv6 and TCP forwarding</li>
+              <li>RCON relay or source-IP restoration</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="reference">
+      <div class="shell">
+        <p class="section-kicker">CLI reference</p>
+        <h2>Small surface. Clear behavior.</h2>
+        <p class="section-intro">Only <code>--server</code> is required. Defaults favor a private upstream and a separate public legacy port.</p>
+        <div class="table-wrap">
+          <table class="cli-table">
+            <thead>
+              <tr>
+                <th scope="col">Option</th>
+                <th scope="col">Purpose</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>-s, --server ADDR</td>
+                <td>QSS-M protocol 666 endpoint. Port defaults to 26000.</td>
+              </tr>
+              <tr>
+                <td>-l, --listen ADDR</td>
+                <td>Legacy-facing listener. Defaults to <code>0.0.0.0:26001</code>.</td>
+              </tr>
+              <tr>
+                <td>-a, --advertise ADDR</td>
+                <td>Public address written into server-browser replies. The listener port is appended when omitted.</td>
+              </tr>
+              <tr>
+                <td>-m, --max-sessions N</td>
+                <td>Total session slots. Defaults to 64 and is capped at 256.</td>
+              </tr>
+              <tr>
+                <td>-v, --verbose</td>
+                <td>Log connections, malformed packets, and translation errors.</td>
+              </tr>
+              <tr>
+                <td>--version / --help</td>
+                <td>Print the proxy version or complete command-line help.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="closing">
+      <div class="shell">
+        <div class="closing-card">
+          <p class="section-kicker">Ready when the old client is</p>
+          <h2>Keep the server modern.<br>Keep the doorway open.</h2>
+          <p>Build from source or download the current macOS and Windows artifacts from the cross-platform CI workflow.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://github.com/timbergeron/nq666-proxy">View source</a>
+            <a class="button button-secondary" href="https://github.com/timbergeron/nq666-proxy/actions/workflows/ci.yml">View builds</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footer-row shell">
+      <span>nq666-proxy · GPL-2.0-or-later</span>
+      <div class="footer-links">
+        <a href="https://github.com/timbergeron/nq666-proxy/blob/main/README.md">README</a>
+        <a href="https://github.com/timbergeron/nq666-proxy/blob/main/LICENSE">License</a>
+        <a href="https://raw.githack.com/timbergeron/nq666-proxy/main/docs/index.html">RawGitHack view</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (() => {
+      const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+
+      function selectTab(selected) {
+        tabs.forEach((tab) => {
+          const active = tab === selected;
+          tab.setAttribute('aria-selected', String(active));
+          tab.tabIndex = active ? 0 : -1;
+          document.getElementById(tab.getAttribute('aria-controls')).hidden = !active;
+        });
+      }
+
+      tabs.forEach((tab, index) => {
+        tab.addEventListener('click', () => selectTab(tab));
+        tab.addEventListener('keydown', (event) => {
+          if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+          event.preventDefault();
+          const offset = event.key === 'ArrowRight' ? 1 : -1;
+          const next = tabs[(index + offset + tabs.length) % tabs.length];
+          selectTab(next);
+          next.focus();
+        });
+      });
+
+      document.querySelectorAll('[data-copy]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const text = button.parentElement.querySelector('code').textContent;
+          try {
+            await navigator.clipboard.writeText(text);
+            button.textContent = 'Copied';
+          } catch (_) {
+            const field = document.createElement('textarea');
+            field.value = text;
+            field.setAttribute('readonly', '');
+            field.style.position = 'fixed';
+            field.style.opacity = '0';
+            document.body.appendChild(field);
+            field.select();
+            document.execCommand('copy');
+            field.remove();
+            button.textContent = 'Copied';
+          }
+          window.setTimeout(() => { button.textContent = 'Copy'; }, 1600);
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
