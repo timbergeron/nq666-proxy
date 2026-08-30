@@ -1,0 +1,18 @@
+[Unit]
+Description=NetQuake protocol 15 to QSS-M protocol 666 proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/local/bin/nq666-proxy --server 127.0.0.1:26000 --listen 0.0.0.0:26001 --advertise YOUR_PUBLIC_IP:26001
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
