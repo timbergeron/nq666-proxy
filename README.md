@@ -1,5 +1,7 @@
 # nq666-proxy
 
+[![CI](https://github.com/timbergeron/nq666-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/timbergeron/nq666-proxy/actions/workflows/ci.yml)
+
 `nq666-proxy` is a small, stateful Linux UDP gateway that lets original
 WinQuake and legacy ProQuake clients join a QSS-M server whose gameplay
 protocol is FitzQuake 666.
@@ -24,15 +26,21 @@ headers.
 
 ```sh
 make
-make test
-make integration-test
+make check
+make analyze
+make sanitize
 ```
 
-The unit suite covers server-info downgrade, extended entity and baseline
+`make analyze` uses GCC's static analyzer; the normal build accepts any C11
+compiler supported on Linux.
+
+The unit suite includes deterministic malformed-packet fuzzing and covers
+server-info downgrade, extended entity and baseline
 conversion, client angle expansion, unreliable message splitting, and the
 reliable UDP fragment/ACK sequence. The integration target starts the real
 proxy process between a fake protocol-15 client and protocol-666 server and
-checks the control handshake, `pext` exchange, ACKs, and translated sign-on.
+checks query rewriting, handshake rejection, sanitized `pext` negotiation,
+ACKs, and translated sign-on.
 
 ## Run
 
@@ -60,10 +68,30 @@ clients use QSS-M's port and old clients use the proxy port.
 
 `--advertise` is needed for connects initiated from WinQuake's server browser.
 It rewrites the address in `CCREP_SERVER_INFO`. Direct `connect host:port`
-works without it.
+works without it. When `--listen` names a specific IP instead of `0.0.0.0`,
+that listener address is advertised automatically. If `--advertise` omits a
+port, the bound listener port is appended automatically.
 
-Run `./nq666-proxy --help` for all options. A systemd unit template is included;
-replace `YOUR_PUBLIC_IP` before installing it.
+Run `./nq666-proxy --help` for all options.
+
+## systemd installation
+
+```sh
+sudo make install
+sudo install -m 0644 \
+  /usr/local/share/doc/nq666-proxy/nq666-proxy.default \
+  /etc/default/nq666-proxy
+sudo editor /etc/default/nq666-proxy
+sudo systemctl daemon-reload
+sudo systemctl enable --now nq666-proxy
+sudo systemctl status nq666-proxy
+```
+
+Set `NQ666_ARGS` in `/etc/default/nq666-proxy`; add
+`--advertise PUBLIC_IP:26001` if players will use the server browser. The unit
+runs under a dynamic unprivileged account with filesystem, capability, and
+kernel hardening enabled. Re-running `make install` does not overwrite the
+active `/etc/default/nq666-proxy` configuration.
 
 ## QSS-M configuration
 
@@ -83,7 +111,9 @@ sv_protocol FTE+666
 With `FTE+666`, QSS-M first asks each connecting peer to report extensions.
 An original client reports none, through the proxy, so that individual
 upstream connection remains on the Base-666 wire format that the translator
-supports.
+supports. The proxy also sanitizes the response to this negotiation, ensuring
+that a newer client cannot accidentally enable an extension format on the
+translated connection.
 
 If every player can accept protocol 15, QSS-M can instead be run with
 `sv_protocol Base-15` and no proxy is necessary. The proxy is for keeping a
@@ -116,7 +146,16 @@ after five minutes.
 
 - Put the proxy close to QSS-M; ideally use `127.0.0.1` for the upstream.
 - Start with `--verbose` and inspect translation errors before daemonizing it.
+- Translation failures are reported to the affected client before its session
+  is closed; they are also logged with the client's address.
+- Administrative RCON packets are deliberately not relayed. Manage QSS-M on
+  its private listener or through a separate secured channel.
 - QSS-M sees the VPS address plus a distinct UDP source port for each proxied
   player. IP-based moderation at QSS-M cannot recover the original player IP.
 - The program is a compatibility gateway, not a DDoS filter. Apply normal VPS
   UDP filtering and rate limits in front of it.
+
+## License
+
+This project is licensed under the GNU General Public License, version 2 or
+(at your option) any later version. See [LICENSE](LICENSE).

@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Strict build, unit tests, and UDP integration test
+        run: make clean all check
+      - name: GCC static analyzer
+        run: make analyze
+      - name: Address and undefined-behavior sanitizers
+        run: make sanitize

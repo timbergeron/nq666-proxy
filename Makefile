@@ -1,12 +1,15 @@
 CC ?= cc
+ANALYZER_CC ?= gcc
 CFLAGS ?= -O2
 CPPFLAGS ?=
-WARNINGS = -Wall -Wextra -Wpedantic
+WARNINGS = -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow -Wstrict-prototypes \
+	-Wundef -Wwrite-strings -Wconversion -Wsign-conversion
 
 TARGET = nq666-proxy
 OBJECTS = main.o netchan.o protocol.o
+SANITIZER_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer
 
-.PHONY: all clean test integration-test install
+.PHONY: all clean test integration-test check sanitize analyze install
 
 all: $(TARGET)
 
@@ -34,10 +37,35 @@ integration_test: integration_test.c netchan.h $(TARGET)
 integration-test: integration_test
 	./integration_test
 
+check: test integration-test
+
+tests-sanitize: tests.c netchan.c protocol.c netchan.h protocol.h
+	$(CC) $(CPPFLAGS) -O1 -g $(WARNINGS) -Werror -std=c11 \
+		$(SANITIZER_FLAGS) \
+		-o $@ tests.c netchan.c protocol.c
+
+nq666-proxy-sanitize: main.c netchan.c protocol.c netchan.h protocol.h
+	$(CC) $(CPPFLAGS) -O1 -g $(WARNINGS) -Werror -std=c11 \
+		$(SANITIZER_FLAGS) \
+		-o $@ main.c netchan.c protocol.c
+
+sanitize: tests-sanitize nq666-proxy-sanitize integration_test
+	ASAN_OPTIONS="$${ASAN_OPTIONS:-detect_leaks=1:strict_string_checks=1}" \
+		./tests-sanitize
+	ASAN_OPTIONS="$${ASAN_OPTIONS:-detect_leaks=1:strict_string_checks=1}" \
+		NQ666_PROXY=./nq666-proxy-sanitize ./integration_test
+
+analyze:
+	$(ANALYZER_CC) $(CPPFLAGS) -O0 $(WARNINGS) -Werror -std=c11 -fanalyzer \
+		-fsyntax-only main.c netchan.c protocol.c
+
 install: $(TARGET)
 	install -D -m 0755 $(TARGET) $(DESTDIR)/usr/local/bin/$(TARGET)
 	install -D -m 0644 nq666-proxy.service \
 		$(DESTDIR)/usr/local/lib/systemd/system/nq666-proxy.service
+	install -D -m 0644 nq666-proxy.default \
+		$(DESTDIR)/usr/local/share/doc/nq666-proxy/nq666-proxy.default
 
 clean:
-	rm -f $(TARGET) $(OBJECTS) tests integration_test
+	rm -f $(TARGET) $(OBJECTS) tests integration_test tests-sanitize \
+		nq666-proxy-sanitize

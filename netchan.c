@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "netchan.h"
 
 #include <arpa/inet.h>
@@ -27,7 +28,9 @@ void nq_chan_init(struct nq_chan *chan, size_t mss,
                   nq_send_packet_fn send_packet, void *send_opaque)
 {
     memset(chan, 0, sizeof(*chan));
-    chan->mss = mss;
+    chan->mss = mss > NQ_MAX_WIRE_PAYLOAD ? NQ_MAX_WIRE_PAYLOAD : mss;
+    if (!chan->mss)
+        chan->mss = 1;
     chan->max_queue_bytes = 512u * 1024u;
     chan->send_packet = send_packet;
     chan->send_opaque = send_opaque;
@@ -201,8 +204,15 @@ bool nq_chan_receive(struct nq_chan *chan, const uint8_t *packet,
         return true;
     chan->receive_sequence++;
 
+    if (chan->receive_discarding) {
+        if (flags & NQ_NETFLAG_EOM)
+            chan->receive_discarding = false;
+        return true;
+    }
+
     if (payload_len > sizeof(chan->receive_message) - chan->receive_message_len) {
         chan->receive_message_len = 0;
+        chan->receive_discarding = (flags & NQ_NETFLAG_EOM) == 0;
         return false;
     }
     memcpy(chan->receive_message + chan->receive_message_len, payload,

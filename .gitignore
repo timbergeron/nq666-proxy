@@ -1,5 +1,7 @@
 nq666-proxy
 tests
 integration_test
+tests-sanitize
+nq666-proxy-sanitize
 *.o
 *.log

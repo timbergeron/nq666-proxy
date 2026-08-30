@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #define _POSIX_C_SOURCE 200809L
 
 #include "netchan.h"
@@ -22,18 +23,27 @@
 #define DEFAULT_PORT "26000"
 #define DEFAULT_MAX_SESSIONS 64
 #define MAX_SESSIONS_LIMIT 256
+#define MAX_QUERY_SESSIONS 16
+#define MAX_CONTROL_PACKET 1024
+#define MAX_DATAGRAMS_PER_SOCKET_TICK 64
 #define SESSION_TIMEOUT 300.0
 #define HANDSHAKE_TIMEOUT 8.0
 #define QUERY_TIMEOUT 3.0
 
 #define NET_PROTOCOL_VERSION 3
 #define CCREQ_CONNECT 0x01
+#define CCREQ_SERVER_INFO 0x02
+#define CCREQ_PLAYER_INFO 0x03
+#define CCREQ_RULE_INFO 0x04
 #define CCREP_ACCEPT 0x81
 #define CCREP_REJECT 0x82
 #define CCREP_SERVER_INFO 0x83
 #define MOD_PROQUAKE 1
 #define PQF_IGNOREPORT 0x80
 #define CLC_DISCONNECT 2
+#define SVC_DISCONNECT 2
+#define SVC_PRINT 8
+#define PROXY_VERSION "0.2.0"
 
 enum session_phase {
     SESSION_FREE = 0,
@@ -65,6 +75,7 @@ struct session {
     double created_at;
     double last_activity;
     unsigned int translation_errors;
+    unsigned int limit_warning_generation;
 };
 
 struct proxy {
@@ -195,6 +206,32 @@ static bool resolve_endpoint(const char *text, bool passive,
     return true;
 }
 
+static bool normalize_advertise(const char *text, uint16_t default_port,
+                                char *output, size_t output_size)
+{
+    const char *colon;
+    char *end = NULL;
+    unsigned long port;
+    int written;
+
+    if (!text || !text[0])
+        return false;
+    colon = strrchr(text, ':');
+    if (!colon) {
+        written = snprintf(output, output_size, "%s:%u", text,
+                           (unsigned int)default_port);
+        return written >= 0 && (size_t)written < output_size;
+    }
+    if (colon == text || !colon[1])
+        return false;
+    errno = 0;
+    port = strtoul(colon + 1, &end, 10);
+    if (errno || !end || *end || port < 1 || port > UINT16_MAX)
+        return false;
+    written = snprintf(output, output_size, "%s", text);
+    return written >= 0 && (size_t)written < output_size;
+}
+
 static ssize_t send_packet(void *opaque, const void *packet, size_t packet_len)
 {
     struct packet_target *target = opaque;
@@ -210,6 +247,11 @@ static int open_upstream_socket(const struct sockaddr_in *upstream)
     int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd < 0)
         return -1;
+    if (fd >= FD_SETSIZE) {
+        close(fd);
+        errno = EMFILE;
+        return -1;
+    }
     if (!set_nonblocking(fd) ||
         connect(fd, (const struct sockaddr *)upstream, sizeof(*upstream)) != 0) {
         close(fd);
@@ -256,6 +298,25 @@ static struct session *allocate_session(struct proxy *proxy)
     return NULL;
 }
 
+static size_t query_session_count(const struct proxy *proxy)
+{
+    size_t count = 0;
+    size_t i;
+    for (i = 0; i < proxy->max_sessions; i++) {
+        if (proxy->sessions[i].phase == SESSION_QUERY)
+            count++;
+    }
+    return count;
+}
+
+static size_t query_session_limit(const struct proxy *proxy)
+{
+    size_t limit = proxy->max_sessions / 4;
+    if (limit == 0)
+        limit = 1;
+    return limit < MAX_QUERY_SESSIONS ? limit : MAX_QUERY_SESSIONS;
+}
+
 static bool valid_connect_request(const uint8_t *packet, size_t packet_len)
 {
     static const uint8_t quake_name[] = {'Q','U','A','K','E',0};
@@ -263,6 +324,17 @@ static bool valid_connect_request(const uint8_t *packet, size_t packet_len)
            packet_len >= 12 && packet[4] == CCREQ_CONNECT &&
            memcmp(packet + 5, quake_name, sizeof(quake_name)) == 0 &&
            packet[11] == NET_PROTOCOL_VERSION;
+}
+
+static bool valid_query_request(const uint8_t *packet, size_t packet_len)
+{
+    uint8_t command;
+    if (!nq_packet_is_control(packet, packet_len) ||
+        packet_len > MAX_CONTROL_PACKET)
+        return false;
+    command = packet[4];
+    return command == CCREQ_SERVER_INFO || command == CCREQ_PLAYER_INFO ||
+           command == CCREQ_RULE_INFO;
 }
 
 static void send_control_reject(struct proxy *proxy,
@@ -292,7 +364,7 @@ static void start_connection(struct proxy *proxy,
     struct session *session = find_client_session(proxy, client);
     char address[64];
 
-    if (packet_len > sizeof(session->connect_request)) {
+    if (packet_len > MAX_CONTROL_PACKET) {
         send_control_reject(proxy, client, "Connection request is too large.\n");
         return;
     }
@@ -349,7 +421,12 @@ static void start_connection(struct proxy *proxy,
                  &session->upstream_target);
     nq_xlat_init(&session->xlat, false);
 
-    (void)send(session->upstream_fd, packet, packet_len, 0);
+    if (send(session->upstream_fd, packet, packet_len, 0) !=
+        (ssize_t)packet_len) {
+        send_control_reject(proxy, client, "Proxy could not reach upstream.\n");
+        session_close(session);
+        return;
+    }
     if (proxy->verbose)
         fprintf(stderr, "connect %s\n",
                 address_string(client, address, sizeof(address)));
@@ -360,7 +437,10 @@ static void start_query(struct proxy *proxy,
                         const uint8_t *packet, size_t packet_len,
                         double now)
 {
-    struct session *session = allocate_session(proxy);
+    struct session *session;
+    if (query_session_count(proxy) >= query_session_limit(proxy))
+        return;
+    session = allocate_session(proxy);
     if (!session)
         return;
     session->upstream_fd = open_upstream_socket(&proxy->upstream_address);
@@ -372,7 +452,9 @@ static void start_query(struct proxy *proxy,
     session->client_address = *client;
     session->created_at = now;
     session->last_activity = now;
-    (void)send(session->upstream_fd, packet, packet_len, 0);
+    if (send(session->upstream_fd, packet, packet_len, 0) !=
+        (ssize_t)packet_len)
+        session_close(session);
 }
 
 static void handle_frontend_control(struct proxy *proxy,
@@ -388,7 +470,7 @@ static void handle_frontend_control(struct proxy *proxy,
             return;
         }
         start_connection(proxy, client, packet, packet_len, now);
-    } else {
+    } else if (valid_query_request(packet, packet_len)) {
         start_query(proxy, client, packet, packet_len, now);
     }
 }
@@ -440,6 +522,12 @@ static void handle_pending_upstream(struct proxy *proxy,
     if (!nq_packet_is_control(packet, packet_len))
         return;
     if (packet[4] == CCREP_REJECT) {
+        if (packet_len > MAX_CONTROL_PACKET) {
+            send_control_reject(proxy, &session->client_address,
+                                "Upstream rejection packet is too large.\n");
+            session_close(session);
+            return;
+        }
         (void)sendto(proxy->listen_fd, packet, packet_len, 0,
                      (const struct sockaddr *)&session->client_address,
                      sizeof(session->client_address));
@@ -456,6 +544,12 @@ static void handle_pending_upstream(struct proxy *proxy,
     }
 
     accepted_port = read_le32(packet + 5);
+    if (accepted_port > UINT16_MAX) {
+        send_control_reject(proxy, &session->client_address,
+                            "Upstream returned an invalid port.\n");
+        session_close(session);
+        return;
+    }
     if (packet_len >= 12 && packet[9] == MOD_PROQUAKE) {
         ignore_port = (packet[11] & PQF_IGNOREPORT) != 0;
         client_angle16 = true;
@@ -501,8 +595,52 @@ static bool forward_batch(struct nq_chan *destination,
     return true;
 }
 
-static void translate_client_packet(struct proxy *proxy,
-                                    struct session *session,
+static void notify_client_and_close(struct session *session,
+                                    const char *reason)
+{
+    uint8_t message[512];
+    char address[64];
+    int written;
+    size_t len;
+
+    message[0] = SVC_PRINT;
+    written = snprintf((char *)message + 1, sizeof(message) - 2,
+                       "%cProxy: %s\n", 2, reason);
+    if (written < 0)
+        written = 0;
+    if ((size_t)written >= sizeof(message) - 2)
+        written = (int)sizeof(message) - 3;
+    len = 1 + (size_t)written + 1;
+    message[len++] = SVC_DISCONNECT;
+    (void)nq_chan_send_unreliable(&session->client_chan, message, len);
+    fprintf(stderr, "closing %s: %s\n",
+            address_string(&session->client_address, address, sizeof(address)),
+            reason);
+    session_close(session);
+}
+
+static bool queue_limit_warning(struct session *session, double now)
+{
+    static const uint8_t warning[] = {
+        SVC_PRINT, 2,
+        'P','r','o','x','y',':',' ','t','h','i','s',' ','m','a','p',' ',
+        'e','x','c','e','e','d','s',' ','W','i','n','Q','u','a','k','e',' ',
+        'p','r','e','c','a','c','h','e',' ','l','i','m','i','t','s',';',' ',
+        's','o','m','e',' ','m','o','d','e','l','s','/','s','o','u','n','d','s',' ',
+        'a','r','e',' ','h','i','d','d','e','n','.', '\n', 0
+    };
+    if (!session->xlat.warned_limits ||
+        session->limit_warning_generation ==
+            session->xlat.serverinfo_generation)
+        return true;
+    if (!nq_chan_queue_reliable(&session->client_chan, warning,
+                                sizeof(warning), now))
+        return false;
+    session->limit_warning_generation = session->xlat.serverinfo_generation;
+    return true;
+}
+
+static void translate_client_packet(struct session *session,
                                     const struct nq_received_message *message,
                                     double now)
 {
@@ -514,7 +652,10 @@ static void translate_client_packet(struct proxy *proxy,
     if (!nq_translate_client_message(&session->xlat,
                                      message->data, message->len, reliable,
                                      &batch, error, sizeof(error))) {
-        fprintf(stderr, "legacy client message dropped: %s\n", error);
+        char address[64];
+        fprintf(stderr, "%s: legacy client message dropped: %s\n",
+                address_string(&session->client_address, address,
+                               sizeof(address)), error);
         session->translation_errors++;
     } else if (!forward_batch(&session->upstream_chan, &batch, reliable, now)) {
         fprintf(stderr, "upstream queue overflow\n");
@@ -522,14 +663,12 @@ static void translate_client_packet(struct proxy *proxy,
     }
     nq_batch_free(&batch);
     if (session->translation_errors >= 5) {
-        if (proxy->verbose)
-            fprintf(stderr, "closing client after translation errors\n");
-        session_close(session);
+        notify_client_and_close(session,
+                                "too many invalid client messages");
     }
 }
 
-static void translate_server_packet(struct proxy *proxy,
-                                    struct session *session,
+static void translate_server_packet(struct session *session,
                                     const struct nq_received_message *message,
                                     double now)
 {
@@ -541,17 +680,23 @@ static void translate_server_packet(struct proxy *proxy,
     if (!nq_translate_server_message(&session->xlat,
                                      message->data, message->len, reliable,
                                      &batch, error, sizeof(error))) {
-        fprintf(stderr, "protocol-666 server message dropped: %s\n", error);
+        char address[64];
+        fprintf(stderr, "%s: protocol-666 message dropped: %s\n",
+                address_string(&session->client_address, address,
+                               sizeof(address)), error);
         session->translation_errors++;
+        if (!strncmp(error, "upstream ", 9))
+            session->translation_errors += 5;
     } else if (!forward_batch(&session->client_chan, &batch, reliable, now)) {
         fprintf(stderr, "legacy client queue overflow\n");
+        session->translation_errors += 5;
+    } else if (!queue_limit_warning(session, now)) {
         session->translation_errors += 5;
     }
     nq_batch_free(&batch);
     if (session->translation_errors >= 5) {
-        if (proxy->verbose)
-            fprintf(stderr, "closing client after translation errors\n");
-        session_close(session);
+        notify_client_and_close(session,
+                                "upstream protocol is incompatible");
     }
 }
 
@@ -569,7 +714,7 @@ static void handle_frontend_game(struct proxy *proxy,
         return;
     }
     if (message.kind != NQ_MESSAGE_NONE)
-        translate_client_packet(proxy, session, &message, now);
+        translate_client_packet(session, &message, now);
 }
 
 static void handle_active_upstream(struct proxy *proxy,
@@ -588,14 +733,17 @@ static void handle_active_upstream(struct proxy *proxy,
         return;
     }
     if (message.kind != NQ_MESSAGE_NONE)
-        translate_server_packet(proxy, session, &message, now);
+        translate_server_packet(session, &message, now);
 }
 
 static void receive_frontend(struct proxy *proxy, double now)
 {
     uint8_t packet[65535];
+    unsigned int processed;
 
-    for (;;) {
+    for (processed = 0;
+         processed < MAX_DATAGRAMS_PER_SOCKET_TICK && !stop_requested;
+         processed++) {
         struct sockaddr_in client;
         socklen_t client_len = sizeof(client);
         ssize_t received = recvfrom(proxy->listen_fd, packet, sizeof(packet), 0,
@@ -626,8 +774,11 @@ static void receive_upstream(struct proxy *proxy, struct session *session,
                              double now)
 {
     uint8_t packet[65535];
+    unsigned int processed;
 
-    for (;;) {
+    for (processed = 0;
+         processed < MAX_DATAGRAMS_PER_SOCKET_TICK && !stop_requested;
+         processed++) {
         ssize_t received = recv(session->upstream_fd, packet, sizeof(packet), 0);
         if (received < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -644,7 +795,8 @@ static void receive_upstream(struct proxy *proxy, struct session *session,
         } else if (session->phase == SESSION_QUERY) {
             uint8_t reply[65535];
             size_t reply_len;
-            if (nq_packet_is_control(packet, (size_t)received) &&
+            if ((size_t)received <= MAX_CONTROL_PACKET &&
+                nq_packet_is_control(packet, (size_t)received) &&
                 rewrite_server_info(proxy, packet, (size_t)received,
                                     reply, &reply_len))
                 (void)sendto(proxy->listen_fd, reply, reply_len, 0,
@@ -733,8 +885,9 @@ static void usage(FILE *stream, const char *program)
             "  -s, --server ADDR       QSS-M protocol-666 server\n"
             "  -l, --listen ADDR       Legacy listener (default %s)\n"
             "  -a, --advertise ADDR    Address placed in server-browser replies\n"
-            "  -m, --max-clients N     Proxy session/query slots (default %d)\n"
+            "  -m, --max-sessions N    Total session slots (default %d)\n"
             "  -v, --verbose           Log connections and malformed packets\n"
+            "      --version           Show the proxy version\n"
             "  -h, --help              Show this help\n",
             program, DEFAULT_LISTEN, DEFAULT_MAX_SESSIONS);
 }
@@ -746,7 +899,6 @@ int main(int argc, char **argv)
     const char *advertise_text = NULL;
     size_t max_sessions = DEFAULT_MAX_SESSIONS;
     struct proxy proxy;
-    int reuse = 1;
     int i;
     char listen_display[64];
     char server_display[64];
@@ -764,17 +916,22 @@ int main(int argc, char **argv)
         } else if ((!strcmp(argv[i], "-a") || !strcmp(argv[i], "--advertise")) &&
                    i + 1 < argc) {
             advertise_text = argv[++i];
-        } else if ((!strcmp(argv[i], "-m") || !strcmp(argv[i], "--max-clients")) &&
+        } else if ((!strcmp(argv[i], "-m") ||
+                    !strcmp(argv[i], "--max-sessions") ||
+                    !strcmp(argv[i], "--max-clients")) &&
                    i + 1 < argc) {
             char *end = NULL;
             unsigned long value = strtoul(argv[++i], &end, 10);
             if (!end || *end || value < 1 || value > MAX_SESSIONS_LIMIT) {
-                fprintf(stderr, "invalid --max-clients value\n");
+                fprintf(stderr, "invalid --max-sessions value\n");
                 return 2;
             }
             max_sessions = (size_t)value;
         } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) {
             proxy.verbose = true;
+        } else if (!strcmp(argv[i], "--version")) {
+            printf("nq666-proxy %s\n", PROXY_VERSION);
+            return 0;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(stdout, argv[0]);
             return 0;
@@ -791,22 +948,29 @@ int main(int argc, char **argv)
         !resolve_endpoint(server_text, false, DEFAULT_PORT,
                           &proxy.upstream_address))
         return 2;
-    if (advertise_text) {
-        if (strlen(advertise_text) >= sizeof(proxy.advertise)) {
-            fprintf(stderr, "--advertise value is too long\n");
-            return 2;
-        }
-        (void)snprintf(proxy.advertise, sizeof(proxy.advertise), "%s",
-                       advertise_text);
+    if (!proxy.upstream_address.sin_port) {
+        fprintf(stderr, "upstream port must be between 1 and 65535\n");
+        return 2;
     }
-
+    if (proxy.listen_address.sin_port == proxy.upstream_address.sin_port &&
+        (proxy.listen_address.sin_addr.s_addr ==
+             proxy.upstream_address.sin_addr.s_addr ||
+         (proxy.listen_address.sin_addr.s_addr == htonl(INADDR_ANY) &&
+          (ntohl(proxy.upstream_address.sin_addr.s_addr) >> 24) == 127))) {
+        fprintf(stderr,
+                "listener and upstream resolve to the same local UDP endpoint\n");
+        return 2;
+    }
     proxy.listen_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (proxy.listen_fd < 0) {
         perror("socket");
         return 1;
     }
-    (void)setsockopt(proxy.listen_fd, SOL_SOCKET, SO_REUSEADDR,
-                     &reuse, sizeof(reuse));
+    if (proxy.listen_fd >= FD_SETSIZE) {
+        fprintf(stderr, "listener file descriptor exceeds select() capacity\n");
+        close(proxy.listen_fd);
+        return 1;
+    }
     if (bind(proxy.listen_fd, (const struct sockaddr *)&proxy.listen_address,
              sizeof(proxy.listen_address)) != 0 ||
         !set_nonblocking(proxy.listen_fd)) {
@@ -826,6 +990,17 @@ int main(int argc, char **argv)
         proxy.listen_port = ntohs(actual.sin_port);
         proxy.listen_address.sin_port = actual.sin_port;
     }
+    if (advertise_text &&
+        !normalize_advertise(advertise_text, proxy.listen_port,
+                             proxy.advertise, sizeof(proxy.advertise))) {
+        fprintf(stderr, "invalid --advertise address (use HOST[:PORT])\n");
+        close(proxy.listen_fd);
+        return 2;
+    }
+    if (!advertise_text &&
+        proxy.listen_address.sin_addr.s_addr != htonl(INADDR_ANY))
+        (void)address_string(&proxy.listen_address, proxy.advertise,
+                             sizeof(proxy.advertise));
 
     proxy.sessions = calloc(max_sessions, sizeof(*proxy.sessions));
     if (!proxy.sessions) {
@@ -839,12 +1014,15 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    fprintf(stderr, "nq666-proxy listening on %s, upstream %s\n",
+    fprintf(stderr, "nq666-proxy %s listening on %s, upstream %s\n",
+            PROXY_VERSION,
             address_string(&proxy.listen_address, listen_display,
                            sizeof(listen_display)),
             address_string(&proxy.upstream_address, server_display,
                            sizeof(server_display)));
-    if (!proxy.advertise[0])
+    if (proxy.advertise[0])
+        fprintf(stderr, "server-browser address: %s\n", proxy.advertise);
+    else
         fprintf(stderr,
                 "note: direct connects work; use --advertise for server-browser connects\n");
 

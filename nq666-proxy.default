@@ -1,0 +1,3 @@
+# Arguments used by nq666-proxy.service.
+# Add --advertise PUBLIC_IP:26001 for WinQuake server-browser connects.
+NQ666_ARGS="--server 127.0.0.1:26000 --listen 0.0.0.0:26001"

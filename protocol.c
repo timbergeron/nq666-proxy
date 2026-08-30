@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "protocol.h"
 
 #include <stdarg.h>
@@ -161,7 +162,9 @@ static uint8_t reader_u8(struct reader *reader)
 static uint16_t reader_u16(struct reader *reader)
 {
     const uint8_t *p = reader_take(reader, 2);
-    return p ? (uint16_t)(p[0] | ((uint16_t)p[1] << 8)) : 0;
+    if (!p)
+        return 0;
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
 static uint32_t reader_u32(struct reader *reader)
@@ -231,6 +234,12 @@ static bool writer_reserve(struct writer *writer, size_t extra)
 
 static void writer_bytes(struct writer *writer, const void *data, size_t len)
 {
+    if (!len)
+        return;
+    if (!data) {
+        writer->bad = true;
+        return;
+    }
     if (!writer_reserve(writer, len))
         return;
     memcpy(writer->data + writer->len, data, len);
@@ -277,6 +286,38 @@ static void writer_input_string(struct writer *writer, struct reader *reader)
     if (available > 1)
         writer_bytes(writer, string, available - 1);
     writer_u8(writer, 0);
+}
+
+static bool command_is_pext(const uint8_t *string, size_t wire_len)
+{
+    static const char command[] = "pext";
+    size_t i = 0;
+
+    while (i + 1 < wire_len) {
+        size_t j;
+        while (i + 1 < wire_len && string[i] <= ' ')
+            i++;
+        for (j = 0; j < sizeof(command) - 1; j++) {
+            uint8_t c;
+            if (i + j + 1 >= wire_len)
+                break;
+            c = string[i + j];
+            if (c >= 'A' && c <= 'Z')
+                c = (uint8_t)(c - 'A' + 'a');
+            if (c != (uint8_t)command[j])
+                break;
+        }
+        if (j == sizeof(command) - 1) {
+            size_t end = i + j;
+            if (end < wire_len && (string[end] == 0 || string[end] <= ' '))
+                return true;
+        }
+        while (i + 1 < wire_len && string[i] != ';' && string[i] != '\n')
+            i++;
+        if (i + 1 < wire_len)
+            i++;
+    }
+    return false;
 }
 
 static bool copy_n(struct writer *writer, struct reader *reader, size_t len)
@@ -388,6 +429,8 @@ static bool translate_serverinfo(struct nq_xlat_state *state,
     }
     state->upstream_protocol = protocol;
     state->static_count = 0;
+    state->serverinfo_generation++;
+    state->warned_limits = false;
 
     maxclients = reader_u8(reader);
     gametype = reader_u8(reader);
@@ -523,6 +566,11 @@ static bool translate_sound(struct nq_xlat_state *state,
 
     if (mask & SND_FTE_MOREFLAGS) {
         set_error(error, error_size, "FTE sound extensions were not negotiated");
+        return false;
+    }
+    if (mask & ~(SND_VOLUME | SND_ATTENUATION |
+                 SND_LARGEENTITY | SND_LARGESOUND)) {
+        set_error(error, error_size, "unsupported sound flags 0x%02x", mask);
         return false;
     }
     if (mask & SND_VOLUME)
@@ -763,6 +811,7 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                                  char *error, size_t error_size)
 {
     struct reader reader = {input, input_len, 0, false};
+    struct nq_xlat_state next_state = *state;
     size_t chunk_limit = reliable ? NQ_LEGACY_RELIABLE_MAX :
                                     NQ_LEGACY_DATAGRAM_MAX;
 
@@ -777,7 +826,8 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
 
         writer_init(&writer, chunk_limit);
         if (command & U_SIGNAL) {
-            ok = translate_update(state, command, &reader, &writer, &keep);
+            ok = translate_update(&next_state, command, &reader, &writer,
+                                  &keep);
         } else {
             switch (command) {
             case SVC_NOP:
@@ -793,7 +843,7 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 const uint8_t *value = reader_take(&reader, 4);
                 if (stat >= 32)
                     keep = false;
-                if (keep) {
+                if (keep && value) {
                     writer_u8(&writer, command);
                     writer_u8(&writer, stat);
                     writer_bytes(&writer, value, 4);
@@ -808,10 +858,19 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 break;
             }
             case SVC_SETVIEW:
-            case SVC_STOPSOUND:
                 writer_u8(&writer, command);
                 ok = copy_n(&writer, &reader, 2);
                 break;
+            case SVC_STOPSOUND: {
+                uint16_t packed = reader_u16(&reader);
+                if ((packed >> 3) >= next_state.max_entities)
+                    keep = false;
+                if (keep) {
+                    writer_u8(&writer, command);
+                    writer_u16(&writer, packed);
+                }
+                break;
+            }
             case SVC_TIME:
                 writer_u8(&writer, command);
                 ok = copy_n(&writer, &reader, 4);
@@ -830,7 +889,7 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 break;
             case SVC_SERVERINFO:
                 writer_u8(&writer, command);
-                ok = translate_serverinfo(state, &reader, &writer,
+                ok = translate_serverinfo(&next_state, &reader, &writer,
                                           error, error_size);
                 break;
             case SVC_LIGHTSTYLE:
@@ -840,24 +899,26 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 break;
             case SVC_UPDATENAME:
                 writer_u8(&writer, command);
-                ok = copy_filtered_slot(state, &reader, &writer, 0, true,
+                ok = copy_filtered_slot(&next_state, &reader, &writer, 0, true,
                                         &keep);
                 break;
             case SVC_UPDATEFRAGS:
                 writer_u8(&writer, command);
-                ok = copy_filtered_slot(state, &reader, &writer, 2, false,
+                ok = copy_filtered_slot(&next_state, &reader, &writer, 2,
+                                        false,
                                         &keep);
                 break;
             case SVC_UPDATECOLORS:
                 writer_u8(&writer, command);
-                ok = copy_filtered_slot(state, &reader, &writer, 1, false,
+                ok = copy_filtered_slot(&next_state, &reader, &writer, 1,
+                                        false,
                                         &keep);
                 break;
             case SVC_CLIENTDATA:
                 ok = translate_clientdata(&reader, &writer);
                 break;
             case SVC_SOUND:
-                ok = translate_sound(state, &reader, &writer, &keep,
+                ok = translate_sound(&next_state, &reader, &writer, &keep,
                                      error, error_size);
                 break;
             case SVC_PARTICLE:
@@ -869,11 +930,11 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 ok = copy_n(&writer, &reader, 8);
                 break;
             case SVC_SPAWNSTATIC:
-                ok = translate_baseline(state, &reader, &writer, false,
+                ok = translate_baseline(&next_state, &reader, &writer, false,
                                         true, &keep);
                 break;
             case SVC_SPAWNBASELINE:
-                ok = translate_baseline(state, &reader, &writer, false,
+                ok = translate_baseline(&next_state, &reader, &writer, false,
                                         false, &keep);
                 break;
             case SVC_TEMP_ENTITY:
@@ -886,7 +947,8 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 ok = copy_n(&writer, &reader, 1);
                 break;
             case SVC_SPAWNSTATICSOUND:
-                ok = translate_static_sound(state, &reader, &writer, false,
+                ok = translate_static_sound(&next_state, &reader, &writer,
+                                            false,
                                             &keep);
                 break;
             case SVC_CDTRACK:
@@ -913,15 +975,16 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 (void)reader_take(&reader, 6);
                 break;
             case SVC_SPAWNBASELINE2:
-                ok = translate_baseline(state, &reader, &writer, true,
+                ok = translate_baseline(&next_state, &reader, &writer, true,
                                         false, &keep);
                 break;
             case SVC_SPAWNSTATIC2:
-                ok = translate_baseline(state, &reader, &writer, true,
+                ok = translate_baseline(&next_state, &reader, &writer, true,
                                         true, &keep);
                 break;
             case SVC_SPAWNSTATICSOUND2:
-                ok = translate_static_sound(state, &reader, &writer, true,
+                ok = translate_static_sound(&next_state, &reader, &writer,
+                                            true,
                                             &keep);
                 break;
             default:
@@ -947,6 +1010,7 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
         }
         writer_free(&writer);
     }
+    *state = next_state;
     return true;
 }
 
@@ -971,9 +1035,16 @@ bool nq_translate_client_message(const struct nq_xlat_state *state,
         case CLC_NOP:
         case CLC_DISCONNECT:
             break;
-        case CLC_STRINGCMD:
-            writer_input_string(&writer, &reader);
+        case CLC_STRINGCMD: {
+            static const uint8_t plain_pext[] = {'p', 'e', 'x', 't', 0};
+            size_t wire_len;
+            const uint8_t *string = reader_string(&reader, &wire_len);
+            if (string && command_is_pext(string, wire_len))
+                writer_bytes(&writer, plain_pext, sizeof(plain_pext));
+            else if (string)
+                writer_bytes(&writer, string, wire_len);
             break;
+        }
         case CLC_MOVE: {
             unsigned int i;
             copy_n(&writer, &reader, 4); /* timestamp */
@@ -981,7 +1052,8 @@ bool nq_translate_client_message(const struct nq_xlat_state *state,
                 if (state->client_angle16)
                     copy_n(&writer, &reader, 2);
                 else
-                    writer_u16(&writer, (uint16_t)reader_u8(&reader) << 8);
+                    writer_u16(&writer,
+                               (uint16_t)((uint16_t)reader_u8(&reader) << 8));
             }
             copy_n(&writer, &reader, 8); /* movement, buttons, impulse */
             break;

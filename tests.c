@@ -1,6 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "netchan.h"
 #include "protocol.h"
 
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +33,12 @@ static void put_string(uint8_t **p, const char *string)
     size_t len = strlen(string) + 1;
     memcpy(*p, string, len);
     *p += len;
+}
+
+static void put_be32(uint8_t *p, uint32_t value)
+{
+    value = htonl(value);
+    memcpy(p, &value, 4);
 }
 
 static bool test_serverinfo(void)
@@ -66,6 +74,7 @@ static bool test_serverinfo(void)
     CHECK(out[1] == 15 && out[2] == 0 && out[3] == 0 && out[4] == 0);
     CHECK(out[5] == 4 && out[6] == 1);
     CHECK(state.upstream_protocol == 666);
+    CHECK(state.serverinfo_generation == 1);
     CHECK(state.models_exposed == 3);
     CHECK(state.sounds_exposed == 2);
     nq_batch_free(&batch);
@@ -136,6 +145,60 @@ static bool test_move_angle_expansion(void)
     CHECK(out[7] == 0 && out[8] == 2);
     CHECK(out[9] == 0 && out[10] == 255);
     nq_batch_free(&batch);
+    return true;
+}
+
+static bool test_proquake_angles_preserved(void)
+{
+    uint8_t input[32] = {3};
+    struct nq_xlat_state state;
+    struct nq_batch batch;
+    char error[128];
+
+    input[5] = 0x34; input[6] = 0x12;
+    input[7] = 0x78; input[8] = 0x56;
+    input[9] = 0xbc; input[10] = 0x9a;
+    nq_xlat_init(&state, true);
+    nq_batch_init(&batch);
+    CHECK(nq_translate_client_message(&state, input, 19, false,
+                                      &batch, error, sizeof(error)));
+    CHECK(batch.count == 1 && batch.items[0].len == sizeof(input) - 13);
+    CHECK(batch.items[0].data[5] == 0x34 && batch.items[0].data[6] == 0x12);
+    CHECK(batch.items[0].data[7] == 0x78 && batch.items[0].data[8] == 0x56);
+    CHECK(batch.items[0].data[9] == 0xbc && batch.items[0].data[10] == 0x9a);
+    nq_batch_free(&batch);
+    return true;
+}
+
+static bool test_pext_is_sanitized(void)
+{
+    static const uint8_t input[] = {
+        4, 'P','E','X','T',' ', '1','2','3',' ', '4','5','6', 0
+    };
+    static const uint8_t expected[] = {4, 'p','e','x','t', 0};
+    struct nq_xlat_state state;
+    struct nq_batch batch;
+    char error[128];
+
+    nq_xlat_init(&state, false);
+    nq_batch_init(&batch);
+    CHECK(nq_translate_client_message(&state, input, sizeof(input), true,
+                                      &batch, error, sizeof(error)));
+    CHECK(batch.count == 1 && batch.items[0].len == sizeof(expected));
+    CHECK(memcmp(batch.items[0].data, expected, sizeof(expected)) == 0);
+    nq_batch_free(&batch);
+
+    {
+        static const uint8_t chained[] = {
+            4, 'n','a','m','e',' ','x',';', ' ', 'p','e','x','t',' ', '9', 0
+        };
+        nq_batch_init(&batch);
+        CHECK(nq_translate_client_message(&state, chained, sizeof(chained),
+                                          true, &batch, error, sizeof(error)));
+        CHECK(batch.count == 1 && batch.items[0].len == sizeof(expected));
+        CHECK(memcmp(batch.items[0].data, expected, sizeof(expected)) == 0);
+        nq_batch_free(&batch);
+    }
     return true;
 }
 
@@ -242,15 +305,149 @@ static bool test_reliable_fragmentation(void)
     return true;
 }
 
+static bool test_oversized_reliable_is_fully_discarded(void)
+{
+    static uint8_t first[40008];
+    static uint8_t overflow[30008];
+    uint8_t end[9];
+    uint8_t valid[9];
+    struct nq_chan receiver;
+    struct capture ack = {{0}, 0, 0};
+    struct nq_received_message message;
+
+    memset(first + 8, 0x11, sizeof(first) - 8);
+    put_be32(first, NQ_NETFLAG_DATA | (uint32_t)sizeof(first));
+    put_be32(first + 4, 0);
+    memset(overflow + 8, 0x22, sizeof(overflow) - 8);
+    put_be32(overflow, NQ_NETFLAG_DATA | (uint32_t)sizeof(overflow));
+    put_be32(overflow + 4, 1);
+    put_be32(end, NQ_NETFLAG_DATA | NQ_NETFLAG_EOM | (uint32_t)sizeof(end));
+    put_be32(end + 4, 2);
+    end[8] = 0x33;
+    put_be32(valid, NQ_NETFLAG_DATA | NQ_NETFLAG_EOM |
+                    (uint32_t)sizeof(valid));
+    put_be32(valid + 4, 3);
+    valid[8] = 0x44;
+
+    nq_chan_init(&receiver, 1024, capture_send, &ack);
+    CHECK(nq_chan_receive(&receiver, first, sizeof(first), 1.0, &message));
+    CHECK(message.kind == NQ_MESSAGE_NONE);
+    CHECK(!nq_chan_receive(&receiver, overflow, sizeof(overflow),
+                           1.1, &message));
+    CHECK(receiver.receive_discarding);
+    CHECK(nq_chan_receive(&receiver, end, sizeof(end), 1.2, &message));
+    CHECK(message.kind == NQ_MESSAGE_NONE);
+    CHECK(!receiver.receive_discarding);
+    CHECK(nq_chan_receive(&receiver, valid, sizeof(valid), 1.3, &message));
+    CHECK(message.kind == NQ_MESSAGE_RELIABLE && message.len == 1);
+    CHECK(message.data[0] == 0x44);
+    nq_chan_destroy(&receiver);
+    return true;
+}
+
+static bool test_stop_sound_entity_limit(void)
+{
+    uint8_t input[3] = {16, 0, 0};
+    struct nq_xlat_state state;
+    struct nq_batch batch;
+    char error[128];
+    uint16_t packed = (uint16_t)(600u << 3);
+
+    input[1] = (uint8_t)packed;
+    input[2] = (uint8_t)(packed >> 8);
+    nq_xlat_init(&state, false);
+    nq_batch_init(&batch);
+    CHECK(nq_translate_server_message(&state, input, sizeof(input), false,
+                                      &batch, error, sizeof(error)));
+    CHECK(batch.count == 0);
+    nq_batch_free(&batch);
+    return true;
+}
+
+static bool test_failed_message_preserves_state(void)
+{
+    static const uint8_t truncated_serverinfo[] = {
+        11, 0x9a, 0x02, 0, 0, 4, 1, 'T', 'e', 's', 't', 0,
+        'm', 'a', 'p', 's', '/', 'b', 'a', 'd'
+    };
+    struct nq_xlat_state state;
+    struct nq_xlat_state original;
+    struct nq_batch batch;
+    char error[128];
+
+    nq_xlat_init(&state, false);
+    state.static_count = 7;
+    original = state;
+    nq_batch_init(&batch);
+    CHECK(!nq_translate_server_message(&state, truncated_serverinfo,
+                                       sizeof(truncated_serverinfo), true,
+                                       &batch, error, sizeof(error)));
+    CHECK(memcmp(&state, &original, sizeof(state)) == 0);
+    CHECK(batch.count == 0);
+    nq_batch_free(&batch);
+    return true;
+}
+
+static uint32_t fuzz_random(uint32_t *state)
+{
+    uint32_t value = *state;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    *state = value;
+    return value;
+}
+
+static bool test_malformed_packet_fuzz(void)
+{
+    uint8_t input[256];
+    uint32_t random_state = 0x51a7e5u;
+    unsigned int iteration;
+
+    for (iteration = 0; iteration < 10000; iteration++) {
+        struct nq_xlat_state state;
+        struct nq_batch batch;
+        char error[128];
+        size_t len = fuzz_random(&random_state) % sizeof(input);
+        size_t i;
+        bool reliable = (fuzz_random(&random_state) & 1u) != 0;
+
+        for (i = 0; i < len; i++)
+            input[i] = (uint8_t)fuzz_random(&random_state);
+        nq_xlat_init(&state, (iteration & 1u) != 0);
+        nq_batch_init(&batch);
+        (void)nq_translate_server_message(&state, input, len, reliable,
+                                          &batch, error, sizeof(error));
+        for (i = 0; i < batch.count; i++)
+            CHECK(batch.items[i].len <= (reliable ?
+                  NQ_LEGACY_RELIABLE_MAX : NQ_LEGACY_DATAGRAM_MAX));
+        nq_batch_free(&batch);
+
+        nq_batch_init(&batch);
+        (void)nq_translate_client_message(&state, input, len, reliable,
+                                          &batch, error, sizeof(error));
+        for (i = 0; i < batch.count; i++)
+            CHECK(batch.items[i].len <= (reliable ? 32000u : 1442u));
+        nq_batch_free(&batch);
+    }
+    return true;
+}
+
 int main(void)
 {
     bool (*tests[])(void) = {
         test_serverinfo,
         test_extended_update,
         test_move_angle_expansion,
+        test_proquake_angles_preserved,
+        test_pext_is_sanitized,
         test_baseline2,
         test_unreliable_chunking,
-        test_reliable_fragmentation
+        test_reliable_fragmentation,
+        test_oversized_reliable_is_fully_discarded,
+        test_stop_sound_entity_limit,
+        test_failed_message_preserves_state,
+        test_malformed_packet_fuzz
     };
     size_t i;
     for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {

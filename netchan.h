@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef NQ666_NETCHAN_H
 #define NQ666_NETCHAN_H
 
@@ -41,6 +42,7 @@ struct nq_chan {
 
     uint8_t receive_message[NQ_MAX_WIRE_PAYLOAD];
     size_t receive_message_len;
+    bool receive_discarding;
 
     struct nq_queued_message *queue_head;
     struct nq_queued_message *queue_tail;

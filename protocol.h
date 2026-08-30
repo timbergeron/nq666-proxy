@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef NQ666_PROTOCOL_H
 #define NQ666_PROTOCOL_H
 
@@ -29,6 +30,7 @@ struct nq_xlat_state {
     unsigned int models_exposed;
     unsigned int sounds_exposed;
     unsigned int upstream_protocol;
+    unsigned int serverinfo_generation;
     bool client_angle16;
     bool warned_limits;
 };

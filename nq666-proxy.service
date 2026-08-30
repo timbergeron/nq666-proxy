@@ -6,13 +6,27 @@ Wants=network-online.target
 [Service]
 Type=simple
 DynamicUser=yes
-ExecStart=/usr/local/bin/nq666-proxy --server 127.0.0.1:26000 --listen 0.0.0.0:26001 --advertise YOUR_PUBLIC_IP:26001
+Environment="NQ666_ARGS=--server 127.0.0.1:26000 --listen 0.0.0.0:26001"
+EnvironmentFile=-/etc/default/nq666-proxy
+ExecStart=/usr/local/bin/nq666-proxy $NQ666_ARGS
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=yes
 PrivateTmp=yes
+PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_INET
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

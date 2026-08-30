@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #define _POSIX_C_SOURCE 200809L
 
 #include "netchan.h"
@@ -10,11 +11,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 
 #define CHECK(condition) do { \
@@ -75,6 +76,19 @@ static int bind_loopback(uint16_t *port)
     return fd;
 }
 
+static bool wait_readable(int fd, long microseconds)
+{
+    fd_set read_fds;
+    struct timeval timeout = {
+        microseconds / 1000000L,
+        microseconds % 1000000L
+    };
+
+    FD_ZERO(&read_fds);
+    FD_SET(fd, &read_fds);
+    return select(fd + 1, &read_fds, NULL, NULL, &timeout) > 0;
+}
+
 static void make_reliable(uint8_t *packet, size_t *packet_len,
                           uint32_t sequence, const uint8_t *payload,
                           size_t payload_len)
@@ -107,6 +121,9 @@ int main(void)
     socklen_t peer_len;
     char server_arg[64];
     char listen_arg[64];
+    char advertise_arg[64];
+    char advertised_expected[64];
+    const char *proxy_program = getenv("NQ666_PROXY");
     uint8_t packet[2048];
     uint8_t payload[1024];
     uint8_t *p;
@@ -114,7 +131,10 @@ int main(void)
     ssize_t received;
     bool got_server_ack = false;
     bool got_pext = false;
-    struct timespec startup = {0, 150000000};
+    unsigned int attempt;
+
+    if (!proxy_program || !proxy_program[0])
+        proxy_program = "./nq666-proxy";
 
     server_fd = bind_loopback(&server_port);
     CHECK(server_fd >= 0);
@@ -126,15 +146,17 @@ int main(void)
 
     (void)snprintf(server_arg, sizeof(server_arg), "127.0.0.1:%u", server_port);
     (void)snprintf(listen_arg, sizeof(listen_arg), "127.0.0.1:%u", proxy_port);
+    (void)snprintf(advertise_arg, sizeof(advertise_arg), "198.51.100.20");
+    (void)snprintf(advertised_expected, sizeof(advertised_expected),
+                   "198.51.100.20:%u", proxy_port);
     proxy_pid = fork();
     CHECK(proxy_pid >= 0);
     if (proxy_pid == 0) {
-        execl("./nq666-proxy", "nq666-proxy", "--server", server_arg,
-              "--listen", listen_arg, (char *)NULL);
+        execl(proxy_program, "nq666-proxy", "--server", server_arg,
+              "--listen", listen_arg, "--advertise", advertise_arg,
+              (char *)NULL);
         _exit(127);
     }
-    (void)nanosleep(&startup, NULL);
-
     client_fd = bind_loopback(&unused_port);
     CHECK(client_fd >= 0);
     memset(&proxy_address, 0, sizeof(proxy_address));
@@ -142,6 +164,65 @@ int main(void)
     proxy_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     proxy_address.sin_port = htons(proxy_port);
 
+    /* Server-browser requests must return the public proxy address. */
+    p = packet + 4;
+    *p++ = 2;
+    put_string(&p, "QUAKE");
+    *p++ = 3;
+    packet_len = (size_t)(p - packet);
+    put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
+    for (attempt = 0; attempt < 40; attempt++) {
+        CHECK(sendto(client_fd, packet, packet_len, 0,
+                     (struct sockaddr *)&proxy_address,
+                     sizeof(proxy_address)) == (ssize_t)packet_len);
+        if (wait_readable(server_fd, 50000L))
+            break;
+    }
+    CHECK(attempt < 40);
+    peer_len = sizeof(upstream_peer);
+    received = recvfrom(server_fd, packet, sizeof(packet), 0,
+                        (struct sockaddr *)&upstream_peer, &peer_len);
+    CHECK(received >= 12 && packet[4] == 2);
+    p = packet + 4;
+    *p++ = 0x83;
+    put_string(&p, "127.0.0.1:1");
+    put_string(&p, "Integration server");
+    put_string(&p, "start");
+    *p++ = 0;
+    *p++ = 4;
+    *p++ = 3;
+    packet_len = (size_t)(p - packet);
+    put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
+    CHECK(sendto(server_fd, packet, packet_len, 0,
+                 (struct sockaddr *)&upstream_peer,
+                 sizeof(upstream_peer)) == (ssize_t)packet_len);
+    received = recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(received > 6 && packet[4] == 0x83);
+    CHECK(!strcmp((char *)packet + 5, advertised_expected));
+
+    /* Do not turn a private upstream RCON endpoint into a public one. */
+    packet_len = 5;
+    packet[4] = 5;
+    put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
+    CHECK(sendto(client_fd, packet, packet_len, 0,
+                 (struct sockaddr *)&proxy_address,
+                 sizeof(proxy_address)) == (ssize_t)packet_len);
+    CHECK(!wait_readable(server_fd, 100000L));
+
+    /* An oversized handshake is rejected without consuming a player slot. */
+    memset(packet, 0, 1025);
+    p = packet + 4;
+    *p++ = 1;
+    put_string(&p, "QUAKE");
+    *p++ = 3;
+    put_be32(packet, NQ_NETFLAG_CTL | 1025u);
+    CHECK(sendto(client_fd, packet, 1025, 0,
+                 (struct sockaddr *)&proxy_address,
+                 sizeof(proxy_address)) == 1025);
+    received = recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(received > 5 && packet[4] == 0x82);
+
+    /* Normal NetQuake connection handshake. */
     p = packet + 4;
     *p++ = 1;
     put_string(&p, "QUAKE");
@@ -152,6 +233,32 @@ int main(void)
                  (struct sockaddr *)&proxy_address,
                  sizeof(proxy_address)) == (ssize_t)packet_len);
 
+    peer_len = sizeof(upstream_peer);
+    received = recvfrom(server_fd, packet, sizeof(packet), 0,
+                        (struct sockaddr *)&upstream_peer, &peer_len);
+    CHECK(received >= 12 && packet[4] == 1);
+
+    /* Reject an impossible game port, then allow a clean retry. */
+    p = packet + 4;
+    *p++ = 0x81;
+    put_le32(&p, 70000u);
+    packet_len = (size_t)(p - packet);
+    put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
+    CHECK(sendto(server_fd, packet, packet_len, 0,
+                 (struct sockaddr *)&upstream_peer,
+                 sizeof(upstream_peer)) == (ssize_t)packet_len);
+    received = recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(received > 5 && packet[4] == 0x82);
+
+    p = packet + 4;
+    *p++ = 1;
+    put_string(&p, "QUAKE");
+    *p++ = 3;
+    packet_len = (size_t)(p - packet);
+    put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
+    CHECK(sendto(client_fd, packet, packet_len, 0,
+                 (struct sockaddr *)&proxy_address,
+                 sizeof(proxy_address)) == (ssize_t)packet_len);
     peer_len = sizeof(upstream_peer);
     received = recvfrom(server_fd, packet, sizeof(packet), 0,
                         (struct sockaddr *)&upstream_peer, &peer_len);
@@ -190,7 +297,7 @@ int main(void)
 
     p = payload;
     *p++ = 4;
-    put_string(&p, "pext");
+    put_string(&p, "pext 123 456");
     make_reliable(packet, &packet_len, 0, payload, (size_t)(p - payload));
     CHECK(sendto(client_fd, packet, packet_len, 0,
                  (struct sockaddr *)&proxy_address,
