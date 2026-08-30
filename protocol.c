@@ -132,6 +132,11 @@ struct writer {
     bool bad;
 };
 
+#if defined(__MINGW32__)
+__attribute__((format(gnu_printf, 3, 4)))
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 3, 4)))
+#endif
 static void set_error(char *error, size_t error_size, const char *fmt, ...)
 {
     va_list args;

@@ -968,6 +968,11 @@ int main(int argc, char **argv)
         nq_report_socket_error("socket");
         return 1;
     }
+    if (!nq_socket_disable_udp_connreset(proxy.listen_fd)) {
+        nq_report_socket_error("disable UDP connection reset");
+        (void)nq_close_socket(proxy.listen_fd);
+        return 1;
+    }
     if (!nq_socket_fits_select(proxy.listen_fd)) {
         fprintf(stderr, "listener file descriptor exceeds select() capacity\n");
         (void)nq_close_socket(proxy.listen_fd);

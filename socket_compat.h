@@ -20,7 +20,12 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <windows.h>
+
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 
 typedef SOCKET nq_socket_t;
 typedef int nq_socklen_t;
@@ -47,6 +52,15 @@ static inline bool nq_set_nonblocking(nq_socket_t socket_fd)
 {
     u_long enabled = 1;
     return ioctlsocket(socket_fd, (long)FIONBIO, &enabled) == 0;
+}
+
+static inline bool nq_socket_disable_udp_connreset(nq_socket_t socket_fd)
+{
+    BOOL enabled = FALSE;
+    DWORD bytes_returned = 0;
+    return WSAIoctl(socket_fd, SIO_UDP_CONNRESET, &enabled,
+                    (DWORD)sizeof(enabled), NULL, 0, &bytes_returned,
+                    NULL, NULL) == 0;
 }
 
 static inline int nq_socket_last_error(void)
@@ -204,6 +218,12 @@ static inline bool nq_set_nonblocking(nq_socket_t socket_fd)
     int flags = fcntl(socket_fd, F_GETFL, 0);
     return flags >= 0 &&
            fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static inline bool nq_socket_disable_udp_connreset(nq_socket_t socket_fd)
+{
+    (void)socket_fd;
+    return true;
 }
 
 static inline int nq_socket_last_error(void)

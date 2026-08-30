@@ -63,6 +63,10 @@ static nq_socket_t bind_loopback(uint16_t *port)
     nq_socket_t fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd == NQ_INVALID_SOCKET)
         return NQ_INVALID_SOCKET;
+    if (!nq_socket_disable_udp_connreset(fd)) {
+        (void)nq_close_socket(fd);
+        return NQ_INVALID_SOCKET;
+    }
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
