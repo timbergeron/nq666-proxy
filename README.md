@@ -19,6 +19,13 @@ channel independently on each side and translates the gameplay payloads:
   datagram and 8192-byte message limits;
 - server-browser control queries are relayed, with optional address rewriting.
 
+## Repository layout
+
+- `src/` contains the proxy implementation and its internal headers.
+- `tests/` contains the unit and process integration test programs.
+- `packaging/systemd/` contains the Linux service and default configuration.
+- `.github/workflows/` contains the cross-platform CI and artifact builds.
+
 ## Build and test
 
 The only build dependency is a C11 compiler and the platform socket headers.

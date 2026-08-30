@@ -1,7 +1,7 @@
 nq666-proxy
 nq666-proxy.exe
-tests
-tests.exe
+unit_tests
+unit_tests.exe
 integration_test
 integration_test.exe
 tests-sanitize
