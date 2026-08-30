@@ -1,6 +1,9 @@
 nq666-proxy
+nq666-proxy.exe
 tests
+tests.exe
 integration_test
+integration_test.exe
 tests-sanitize
 nq666-proxy-sanitize
 *.o

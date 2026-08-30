@@ -1,7 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "netchan.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -81,7 +85,7 @@ bool nq_chan_queue_reliable(struct nq_chan *chan, const uint8_t *data,
 {
     struct nq_queued_message *message;
 
-    if (!len || len > NQ_MAX_WIRE_PAYLOAD ||
+    if (!len || len > NQ_MAX_RELIABLE_MESSAGE ||
         len > chan->max_queue_bytes - chan->queued_bytes)
         return false;
 

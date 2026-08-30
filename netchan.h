@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/types.h>
 
 #define NQ_NETFLAG_LENGTH_MASK 0x0000ffffu
 #define NQ_NETFLAG_DATA        0x00010000u
@@ -16,9 +15,10 @@
 #define NQ_NETFLAG_CTL         0x80000000u
 #define NQ_NET_HEADERSIZE      8u
 #define NQ_MAX_WIRE_PAYLOAD    (65535u - NQ_NET_HEADERSIZE)
+#define NQ_MAX_RELIABLE_MESSAGE 65535u
 
-typedef ssize_t (*nq_send_packet_fn)(void *opaque, const void *packet,
-                                     size_t packet_len);
+typedef int (*nq_send_packet_fn)(void *opaque, const void *packet,
+                                 size_t packet_len);
 
 enum nq_message_kind {
     NQ_MESSAGE_NONE = 0,
@@ -40,7 +40,7 @@ struct nq_chan {
     uint32_t receive_sequence;
     uint32_t unreliable_receive_sequence;
 
-    uint8_t receive_message[NQ_MAX_WIRE_PAYLOAD];
+    uint8_t receive_message[NQ_MAX_RELIABLE_MESSAGE];
     size_t receive_message_len;
     bool receive_discarding;
 

@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
+  linux:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -19,3 +19,51 @@ jobs:
         run: make analyze
       - name: Address and undefined-behavior sanitizers
         run: make sanitize
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Universal build, unit tests, and UDP integration test
+        run: >-
+          make clean all check
+          CFLAGS="-O2 -arch arm64 -arch x86_64 -mmacosx-version-min=11.0"
+      - name: Verify universal architectures
+        run: lipo -verify_arch arm64 x86_64 nq666-proxy
+      - name: Package universal binary
+        run: >-
+          tar -czf nq666-proxy-macos-universal.tar.gz
+          nq666-proxy README.md LICENSE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nq666-proxy-macos-universal
+          path: nq666-proxy-macos-universal.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Keep repository files in LF format
+        run: git config --global core.autocrlf input
+      - uses: actions/checkout@v7
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: make mingw-w64-ucrt-x86_64-gcc
+      - name: Native build, unit tests, and UDP integration test
+        shell: msys2 {0}
+        run: make OS=Windows_NT CC=gcc clean all check
+      - name: Package Windows binary
+        shell: pwsh
+        run: >-
+          Compress-Archive
+          -Path nq666-proxy.exe,README.md,LICENSE
+          -DestinationPath nq666-proxy-windows-x86_64.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nq666-proxy-windows-x86_64
+          path: nq666-proxy-windows-x86_64.zip
+          if-no-files-found: error

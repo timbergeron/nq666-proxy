@@ -115,6 +115,7 @@ enum {
                             ((uint32_t)'E' << 16) | ((uint32_t)'X' << 24))
 #define PROTOCOL_FTE_PEXT2 ((uint32_t)'F' | ((uint32_t)'T' << 8) | \
                             ((uint32_t)'E' << 16) | ((uint32_t)'2' << 24))
+#define NQ_LEGACY_LIGHTSTYLES 64u
 
 struct reader {
     const uint8_t *data;
@@ -526,7 +527,8 @@ static bool translate_baseline(struct nq_xlat_state *state,
         model = 0;
     writer_u8(writer, (uint8_t)model);
     writer_u8(writer, (uint8_t)frame);
-    writer_bytes(writer, tail, 11);
+    writer_u8(writer, tail[0] > state->max_scoreboard ? 0 : tail[0]);
+    writer_bytes(writer, tail + 1, 10);
     return !writer->bad;
 }
 
@@ -605,10 +607,15 @@ static bool translate_sound(struct nq_xlat_state *state,
     return !writer->bad;
 }
 
-static bool translate_clientdata(struct reader *reader, struct writer *writer)
+static bool translate_clientdata(const struct nq_xlat_state *state,
+                                 struct reader *reader,
+                                 struct writer *writer)
 {
     uint32_t bits = reader_u16(reader);
     struct writer base;
+    size_t weapon_model_offset = 0;
+    uint8_t weapon_model_high = 0;
+    bool has_weapon_model = false;
     unsigned int i;
 
     writer_init(&base, 128);
@@ -626,10 +633,14 @@ static bool translate_clientdata(struct reader *reader, struct writer *writer)
     copy_n(&base, reader, 4); /* items is always present */
     if (bits & (1u << 12)) copy_n(&base, reader, 1);
     if (bits & (1u << 13)) copy_n(&base, reader, 1);
-    if (bits & (1u << 14)) copy_n(&base, reader, 1);
+    if (bits & (1u << 14)) {
+        weapon_model_offset = base.len;
+        has_weapon_model = true;
+        copy_n(&base, reader, 1);
+    }
     copy_n(&base, reader, 8); /* health, ammo[5], active weapon */
 
-    if (bits & SU_WEAPON2) (void)reader_u8(reader);
+    if (bits & SU_WEAPON2) weapon_model_high = reader_u8(reader);
     if (bits & SU_ARMOR2) (void)reader_u8(reader);
     if (bits & SU_AMMO2) (void)reader_u8(reader);
     if (bits & SU_SHELLS2) (void)reader_u8(reader);
@@ -639,10 +650,22 @@ static bool translate_clientdata(struct reader *reader, struct writer *writer)
     if (bits & SU_WEAPONFRAME2) (void)reader_u8(reader);
     if (bits & SU_WEAPONALPHA) (void)reader_u8(reader);
 
+    if (reader->bad || base.bad) {
+        writer_free(&base);
+        return false;
+    }
+    if (has_weapon_model) {
+        uint16_t weapon_model =
+            (uint16_t)(base.data[weapon_model_offset] |
+                       ((uint16_t)weapon_model_high << 8));
+        if (weapon_model >= state->models_exposed)
+            base.data[weapon_model_offset] = 0;
+    }
+
     writer_u8(writer, SVC_CLIENTDATA);
     writer_u16(writer, (uint16_t)(bits & 0x7fffu));
     writer_bytes(writer, base.data, base.len);
-    if (reader->bad || base.bad || writer->bad) {
+    if (writer->bad) {
         writer_free(&base);
         return false;
     }
@@ -723,7 +746,9 @@ static bool translate_update(struct nq_xlat_state *state, uint8_t command,
         writer_u8(writer, (uint8_t)model);
     }
     if (out_bits & U_FRAME) writer_u8(writer, value.frame);
-    if (out_bits & U_COLORMAP) writer_u8(writer, value.colormap);
+    if (out_bits & U_COLORMAP)
+        writer_u8(writer, value.colormap > state->max_scoreboard ?
+                          0 : value.colormap);
     if (out_bits & U_SKIN) writer_u8(writer, value.skin);
     if (out_bits & U_EFFECTS) writer_u8(writer, value.effects);
     for (i = 0; i < 3; i++) {
@@ -857,10 +882,16 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                                        NQ_PROTOCOL_NETQUAKE : protocol);
                 break;
             }
-            case SVC_SETVIEW:
-                writer_u8(&writer, command);
-                ok = copy_n(&writer, &reader, 2);
+            case SVC_SETVIEW: {
+                uint16_t entity = reader_u16(&reader);
+                if (entity >= next_state.max_entities)
+                    keep = false;
+                if (keep) {
+                    writer_u8(&writer, command);
+                    writer_u16(&writer, entity);
+                }
                 break;
+            }
             case SVC_STOPSOUND: {
                 uint16_t packed = reader_u16(&reader);
                 if ((packed >> 3) >= next_state.max_entities)
@@ -892,11 +923,19 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 ok = translate_serverinfo(&next_state, &reader, &writer,
                                           error, error_size);
                 break;
-            case SVC_LIGHTSTYLE:
-                writer_u8(&writer, command);
-                ok = copy_n(&writer, &reader, 1);
-                writer_input_string(&writer, &reader);
+            case SVC_LIGHTSTYLE: {
+                uint8_t style = reader_u8(&reader);
+                size_t string_len;
+                const uint8_t *string = reader_string(&reader, &string_len);
+                if (style >= NQ_LEGACY_LIGHTSTYLES)
+                    keep = false;
+                if (keep && string) {
+                    writer_u8(&writer, command);
+                    writer_u8(&writer, style);
+                    writer_bytes(&writer, string, string_len);
+                }
                 break;
+            }
             case SVC_UPDATENAME:
                 writer_u8(&writer, command);
                 ok = copy_filtered_slot(&next_state, &reader, &writer, 0, true,
@@ -915,7 +954,7 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                                         &keep);
                 break;
             case SVC_CLIENTDATA:
-                ok = translate_clientdata(&reader, &writer);
+                ok = translate_clientdata(&next_state, &reader, &writer);
                 break;
             case SVC_SOUND:
                 ok = translate_sound(&next_state, &reader, &writer, &keep,

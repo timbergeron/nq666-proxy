@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/timbergeron/nq666-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/timbergeron/nq666-proxy/actions/workflows/ci.yml)
 
-`nq666-proxy` is a small, stateful Linux UDP gateway that lets original
-WinQuake and legacy ProQuake clients join a QSS-M server whose gameplay
-protocol is FitzQuake 666.
+`nq666-proxy` is a small, stateful UDP gateway for Linux, macOS, and Windows
+that lets original WinQuake and legacy ProQuake clients join a QSS-M server
+whose gameplay protocol is FitzQuake 666.
 
 It is not a port forwarder. The program terminates NetQuake's reliable UDP
 channel independently on each side and translates the gameplay payloads:
@@ -21,26 +21,43 @@ channel independently on each side and translates the gameplay payloads:
 
 ## Build and test
 
-The only build dependency is a C11 compiler and the normal Linux/POSIX socket
-headers.
+The only build dependency is a C11 compiler and the platform socket headers.
+On Linux and macOS:
 
 ```sh
 make
 make check
+```
+
+Additional Linux checks are available with GCC:
+
+```sh
 make analyze
 make sanitize
 ```
 
 `make analyze` uses GCC's static analyzer; the normal build accepts any C11
-compiler supported on Linux.
+compiler supported on Linux or macOS. CI also publishes a universal macOS
+artifact containing Apple Silicon and Intel slices.
+
+On Windows, build in an MSYS2 UCRT64 shell with its GCC and Make packages
+installed:
+
+```sh
+make
+make check
+```
+
+The resulting executable is `nq666-proxy.exe`. CI publishes a 64-bit Windows
+artifact and runs both the unit and UDP process integration suites.
 
 The unit suite includes deterministic malformed-packet fuzzing and covers
 server-info downgrade, extended entity and baseline
-conversion, client angle expansion, unreliable message splitting, and the
-reliable UDP fragment/ACK sequence. The integration target starts the real
-proxy process between a fake protocol-15 client and protocol-666 server and
-checks query rewriting, handshake rejection, sanitized `pext` negotiation,
-ACKs, and translated sign-on.
+conversion, model/entity reference filtering, client angle expansion,
+unreliable message splitting, and the reliable UDP fragment/ACK sequence. The
+integration target starts the real proxy process between a fake protocol-15
+client and protocol-666 server and checks query rewriting, handshake rejection,
+sanitized `pext` negotiation, ACKs, and translated sign-on.
 
 ## Run
 
@@ -131,6 +148,7 @@ The proxy therefore applies conservative client limits:
 | Sounds | 255 precaches | Higher sound events are omitted |
 | Dynamic entities | 600 WinQuake / 2048 ProQuake | Higher entities are omitted |
 | Static entities | 128 | Additional statics are omitted |
+| Light styles | 64 | Higher style updates are omitted |
 
 This is intended for standard Quake and similarly sized multiplayer maps. A
 map or mod that fundamentally requires FitzQuake limits may connect but will

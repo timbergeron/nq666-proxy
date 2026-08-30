@@ -3,21 +3,15 @@
 
 #include "netchan.h"
 #include "protocol.h"
+#include "socket_compat.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
 
 #define DEFAULT_LISTEN "0.0.0.0:26001"
 #define DEFAULT_PORT "26000"
@@ -53,14 +47,14 @@ enum session_phase {
 };
 
 struct packet_target {
-    int fd;
+    nq_socket_t fd;
     bool connected;
     struct sockaddr_in address;
 };
 
 struct session {
     enum session_phase phase;
-    int upstream_fd;
+    nq_socket_t upstream_fd;
     struct sockaddr_in client_address;
     struct sockaddr_in upstream_address;
     struct packet_target client_target;
@@ -79,7 +73,7 @@ struct session {
 };
 
 struct proxy {
-    int listen_fd;
+    nq_socket_t listen_fd;
     struct sockaddr_in listen_address;
     struct sockaddr_in upstream_address;
     uint16_t listen_port;
@@ -95,14 +89,6 @@ static void on_signal(int signal_number)
 {
     (void)signal_number;
     stop_requested = 1;
-}
-
-static double monotonic_seconds(void)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        return 0;
-    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
 static uint32_t read_le32(const uint8_t *p)
@@ -142,12 +128,6 @@ static bool same_address(const struct sockaddr_in *a,
     return a->sin_family == b->sin_family &&
            a->sin_port == b->sin_port &&
            a->sin_addr.s_addr == b->sin_addr.s_addr;
-}
-
-static bool set_nonblocking(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
 static bool split_endpoint(const char *text, char *host, size_t host_size,
@@ -232,30 +212,31 @@ static bool normalize_advertise(const char *text, uint16_t default_port,
     return written >= 0 && (size_t)written < output_size;
 }
 
-static ssize_t send_packet(void *opaque, const void *packet, size_t packet_len)
+static int send_packet(void *opaque, const void *packet, size_t packet_len)
 {
     struct packet_target *target = opaque;
     if (target->connected)
-        return send(target->fd, packet, packet_len, 0);
-    return sendto(target->fd, packet, packet_len, 0,
-                  (const struct sockaddr *)&target->address,
-                  sizeof(target->address));
+        return nq_socket_send(target->fd, packet, packet_len, 0);
+    return nq_socket_sendto(target->fd, packet, packet_len, 0,
+                            (const struct sockaddr *)&target->address,
+                            (nq_socklen_t)sizeof(target->address));
 }
 
-static int open_upstream_socket(const struct sockaddr_in *upstream)
+static nq_socket_t open_upstream_socket(const struct sockaddr_in *upstream)
 {
-    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0)
-        return -1;
-    if (fd >= FD_SETSIZE) {
-        close(fd);
-        errno = EMFILE;
-        return -1;
+    nq_socket_t fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == NQ_INVALID_SOCKET)
+        return NQ_INVALID_SOCKET;
+    if (!nq_socket_fits_select(fd)) {
+        (void)nq_close_socket(fd);
+        nq_socket_set_capacity_error();
+        return NQ_INVALID_SOCKET;
     }
-    if (!set_nonblocking(fd) ||
-        connect(fd, (const struct sockaddr *)upstream, sizeof(*upstream)) != 0) {
-        close(fd);
-        return -1;
+    if (!nq_set_nonblocking(fd) ||
+        nq_socket_connect(fd, (const struct sockaddr *)upstream,
+                          (nq_socklen_t)sizeof(*upstream)) != 0) {
+        (void)nq_close_socket(fd);
+        return NQ_INVALID_SOCKET;
     }
     return fd;
 }
@@ -266,10 +247,10 @@ static void session_close(struct session *session)
         return;
     nq_chan_destroy(&session->client_chan);
     nq_chan_destroy(&session->upstream_chan);
-    if (session->upstream_fd >= 0)
-        close(session->upstream_fd);
+    if (session->upstream_fd != NQ_INVALID_SOCKET)
+        (void)nq_close_socket(session->upstream_fd);
     memset(session, 0, sizeof(*session));
-    session->upstream_fd = -1;
+    session->upstream_fd = NQ_INVALID_SOCKET;
 }
 
 static struct session *find_client_session(struct proxy *proxy,
@@ -291,7 +272,7 @@ static struct session *allocate_session(struct proxy *proxy)
     size_t i;
     for (i = 0; i < proxy->max_sessions; i++) {
         if (proxy->sessions[i].phase == SESSION_FREE) {
-            proxy->sessions[i].upstream_fd = -1;
+            proxy->sessions[i].upstream_fd = NQ_INVALID_SOCKET;
             return &proxy->sessions[i];
         }
     }
@@ -352,8 +333,9 @@ static void send_control_reject(struct proxy *proxy,
     packet[4] = CCREP_REJECT;
     memcpy(packet + 5, reason, reason_len);
     packet[5 + reason_len] = 0;
-    (void)sendto(proxy->listen_fd, packet, len, 0,
-                 (const struct sockaddr *)client, sizeof(*client));
+    (void)nq_socket_sendto(proxy->listen_fd, packet, len, 0,
+                           (const struct sockaddr *)client,
+                           (nq_socklen_t)sizeof(*client));
 }
 
 static void start_connection(struct proxy *proxy,
@@ -372,13 +354,15 @@ static void start_connection(struct proxy *proxy,
     if (session) {
         if (now - session->created_at < 2.0) {
             if (session->phase == SESSION_PENDING)
-                (void)send(session->upstream_fd, session->connect_request,
-                           session->connect_request_len, 0);
+                (void)nq_socket_send(session->upstream_fd,
+                                     session->connect_request,
+                                     session->connect_request_len, 0);
             else if (session->accept_reply_len)
-                (void)sendto(proxy->listen_fd, session->accept_reply,
-                             session->accept_reply_len, 0,
-                             (const struct sockaddr *)client,
-                             sizeof(*client));
+                (void)nq_socket_sendto(proxy->listen_fd,
+                                       session->accept_reply,
+                                       session->accept_reply_len, 0,
+                                       (const struct sockaddr *)client,
+                                       (nq_socklen_t)sizeof(*client));
             return;
         }
         if (session->phase == SESSION_ACTIVE) {
@@ -395,7 +379,7 @@ static void start_connection(struct proxy *proxy,
         return;
     }
     session->upstream_fd = open_upstream_socket(&proxy->upstream_address);
-    if (session->upstream_fd < 0) {
+    if (session->upstream_fd == NQ_INVALID_SOCKET) {
         send_control_reject(proxy, client, "Proxy upstream error.\n");
         session_close(session);
         return;
@@ -421,8 +405,8 @@ static void start_connection(struct proxy *proxy,
                  &session->upstream_target);
     nq_xlat_init(&session->xlat, false);
 
-    if (send(session->upstream_fd, packet, packet_len, 0) !=
-        (ssize_t)packet_len) {
+    if (nq_socket_send(session->upstream_fd, packet, packet_len, 0) !=
+        (int)packet_len) {
         send_control_reject(proxy, client, "Proxy could not reach upstream.\n");
         session_close(session);
         return;
@@ -444,7 +428,7 @@ static void start_query(struct proxy *proxy,
     if (!session)
         return;
     session->upstream_fd = open_upstream_socket(&proxy->upstream_address);
-    if (session->upstream_fd < 0) {
+    if (session->upstream_fd == NQ_INVALID_SOCKET) {
         session_close(session);
         return;
     }
@@ -452,8 +436,8 @@ static void start_query(struct proxy *proxy,
     session->client_address = *client;
     session->created_at = now;
     session->last_activity = now;
-    if (send(session->upstream_fd, packet, packet_len, 0) !=
-        (ssize_t)packet_len)
+    if (nq_socket_send(session->upstream_fd, packet, packet_len, 0) !=
+        (int)packet_len)
         session_close(session);
 }
 
@@ -528,9 +512,10 @@ static void handle_pending_upstream(struct proxy *proxy,
             session_close(session);
             return;
         }
-        (void)sendto(proxy->listen_fd, packet, packet_len, 0,
-                     (const struct sockaddr *)&session->client_address,
-                     sizeof(session->client_address));
+        (void)nq_socket_sendto(
+            proxy->listen_fd, packet, packet_len, 0,
+            (const struct sockaddr *)&session->client_address,
+            (nq_socklen_t)sizeof(session->client_address));
         session_close(session);
         return;
     }
@@ -556,9 +541,10 @@ static void handle_pending_upstream(struct proxy *proxy,
     }
     if (accepted_port && !ignore_port) {
         session->upstream_address.sin_port = htons((uint16_t)accepted_port);
-        if (connect(session->upstream_fd,
-                    (const struct sockaddr *)&session->upstream_address,
-                    sizeof(session->upstream_address)) != 0) {
+        if (nq_socket_connect(
+                session->upstream_fd,
+                (const struct sockaddr *)&session->upstream_address,
+                (nq_socklen_t)sizeof(session->upstream_address)) != 0) {
             send_control_reject(proxy, &session->client_address,
                                 "Proxy could not switch upstream port.\n");
             session_close(session);
@@ -570,9 +556,10 @@ static void handle_pending_upstream(struct proxy *proxy,
     write_le32(reply + 5, proxy->listen_port);
     memcpy(session->accept_reply, reply, packet_len);
     session->accept_reply_len = packet_len;
-    (void)sendto(proxy->listen_fd, reply, packet_len, 0,
-                 (const struct sockaddr *)&session->client_address,
-                 sizeof(session->client_address));
+    (void)nq_socket_sendto(
+        proxy->listen_fd, reply, packet_len, 0,
+        (const struct sockaddr *)&session->client_address,
+        (nq_socklen_t)sizeof(session->client_address));
     session->phase = SESSION_ACTIVE;
     session->last_activity = now;
     nq_xlat_init(&session->xlat, client_angle16);
@@ -745,15 +732,16 @@ static void receive_frontend(struct proxy *proxy, double now)
          processed < MAX_DATAGRAMS_PER_SOCKET_TICK && !stop_requested;
          processed++) {
         struct sockaddr_in client;
-        socklen_t client_len = sizeof(client);
-        ssize_t received = recvfrom(proxy->listen_fd, packet, sizeof(packet), 0,
-                                    (struct sockaddr *)&client, &client_len);
+        nq_socklen_t client_len = (nq_socklen_t)sizeof(client);
+        int received = nq_socket_recvfrom(
+            proxy->listen_fd, packet, sizeof(packet), 0,
+            (struct sockaddr *)&client, &client_len);
         struct session *session;
 
         if (received < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (nq_socket_error_would_block(nq_socket_last_error()))
                 return;
-            perror("recvfrom");
+            nq_report_socket_error("recvfrom");
             return;
         }
         if (client_len != sizeof(client) || received < 4)
@@ -779,9 +767,10 @@ static void receive_upstream(struct proxy *proxy, struct session *session,
     for (processed = 0;
          processed < MAX_DATAGRAMS_PER_SOCKET_TICK && !stop_requested;
          processed++) {
-        ssize_t received = recv(session->upstream_fd, packet, sizeof(packet), 0);
+        int received = nq_socket_recv(session->upstream_fd, packet,
+                                      sizeof(packet), 0);
         if (received < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (nq_socket_error_would_block(nq_socket_last_error()))
                 return;
             session_close(session);
             return;
@@ -799,9 +788,10 @@ static void receive_upstream(struct proxy *proxy, struct session *session,
                 nq_packet_is_control(packet, (size_t)received) &&
                 rewrite_server_info(proxy, packet, (size_t)received,
                                     reply, &reply_len))
-                (void)sendto(proxy->listen_fd, reply, reply_len, 0,
-                             (const struct sockaddr *)&session->client_address,
-                             sizeof(session->client_address));
+                (void)nq_socket_sendto(
+                    proxy->listen_fd, reply, reply_len, 0,
+                    (const struct sockaddr *)&session->client_address,
+                    (nq_socklen_t)sizeof(session->client_address));
             session_close(session);
         } else if (session->phase == SESSION_ACTIVE) {
             handle_active_upstream(proxy, session, packet,
@@ -839,7 +829,7 @@ static int run_proxy(struct proxy *proxy)
     while (!stop_requested) {
         fd_set read_fds;
         struct timeval timeout = {0, 50000};
-        int max_fd = proxy->listen_fd;
+        nq_socket_t max_fd = proxy->listen_fd;
         int ready;
         size_t i;
         double now;
@@ -855,12 +845,12 @@ static int run_proxy(struct proxy *proxy)
             }
         }
 
-        ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
-        now = monotonic_seconds();
+        ready = nq_socket_select(max_fd, &read_fds, &timeout);
+        now = nq_monotonic_seconds();
         if (ready < 0) {
-            if (errno == EINTR)
+            if (nq_socket_error_interrupted(nq_socket_last_error()))
                 continue;
-            perror("select");
+            nq_report_socket_error("select");
             return 1;
         }
         if (FD_ISSET(proxy->listen_fd, &read_fds))
@@ -903,9 +893,10 @@ int main(int argc, char **argv)
     char listen_display[64];
     char server_display[64];
     int result;
+    int socket_status;
 
     memset(&proxy, 0, sizeof(proxy));
-    proxy.listen_fd = -1;
+    proxy.listen_fd = NQ_INVALID_SOCKET;
     for (i = 1; i < argc; i++) {
         if ((!strcmp(argv[i], "-s") || !strcmp(argv[i], "--server")) &&
             i + 1 < argc) {
@@ -944,6 +935,17 @@ int main(int argc, char **argv)
         usage(stderr, argv[0]);
         return 2;
     }
+    socket_status = nq_socket_startup();
+    if (socket_status != 0) {
+        fprintf(stderr, "socket initialization failed: error %d\n",
+                socket_status);
+        return 1;
+    }
+    if (atexit(nq_socket_cleanup) != 0) {
+        nq_socket_cleanup();
+        fprintf(stderr, "could not register socket cleanup\n");
+        return 1;
+    }
     if (!resolve_endpoint(listen_text, true, "26001", &proxy.listen_address) ||
         !resolve_endpoint(server_text, false, DEFAULT_PORT,
                           &proxy.upstream_address))
@@ -962,29 +964,31 @@ int main(int argc, char **argv)
         return 2;
     }
     proxy.listen_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (proxy.listen_fd < 0) {
-        perror("socket");
+    if (proxy.listen_fd == NQ_INVALID_SOCKET) {
+        nq_report_socket_error("socket");
         return 1;
     }
-    if (proxy.listen_fd >= FD_SETSIZE) {
+    if (!nq_socket_fits_select(proxy.listen_fd)) {
         fprintf(stderr, "listener file descriptor exceeds select() capacity\n");
-        close(proxy.listen_fd);
+        (void)nq_close_socket(proxy.listen_fd);
         return 1;
     }
-    if (bind(proxy.listen_fd, (const struct sockaddr *)&proxy.listen_address,
-             sizeof(proxy.listen_address)) != 0 ||
-        !set_nonblocking(proxy.listen_fd)) {
-        perror("bind/nonblocking");
-        close(proxy.listen_fd);
+    if (nq_socket_bind(proxy.listen_fd,
+                       (const struct sockaddr *)&proxy.listen_address,
+                       (nq_socklen_t)sizeof(proxy.listen_address)) != 0 ||
+        !nq_set_nonblocking(proxy.listen_fd)) {
+        nq_report_socket_error("bind/nonblocking");
+        (void)nq_close_socket(proxy.listen_fd);
         return 1;
     }
     {
         struct sockaddr_in actual;
-        socklen_t actual_len = sizeof(actual);
-        if (getsockname(proxy.listen_fd, (struct sockaddr *)&actual,
-                        &actual_len) != 0) {
-            perror("getsockname");
-            close(proxy.listen_fd);
+        nq_socklen_t actual_len = (nq_socklen_t)sizeof(actual);
+        if (nq_socket_getsockname(proxy.listen_fd,
+                                  (struct sockaddr *)&actual,
+                                  &actual_len) != 0) {
+            nq_report_socket_error("getsockname");
+            (void)nq_close_socket(proxy.listen_fd);
             return 1;
         }
         proxy.listen_port = ntohs(actual.sin_port);
@@ -994,7 +998,7 @@ int main(int argc, char **argv)
         !normalize_advertise(advertise_text, proxy.listen_port,
                              proxy.advertise, sizeof(proxy.advertise))) {
         fprintf(stderr, "invalid --advertise address (use HOST[:PORT])\n");
-        close(proxy.listen_fd);
+        (void)nq_close_socket(proxy.listen_fd);
         return 2;
     }
     if (!advertise_text &&
@@ -1005,12 +1009,12 @@ int main(int argc, char **argv)
     proxy.sessions = calloc(max_sessions, sizeof(*proxy.sessions));
     if (!proxy.sessions) {
         perror("calloc");
-        close(proxy.listen_fd);
+        (void)nq_close_socket(proxy.listen_fd);
         return 1;
     }
     proxy.max_sessions = max_sessions;
     for (i = 0; i < (int)max_sessions; i++)
-        proxy.sessions[i].upstream_fd = -1;
+        proxy.sessions[i].upstream_fd = NQ_INVALID_SOCKET;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -1030,6 +1034,6 @@ int main(int argc, char **argv)
     for (i = 0; i < (int)max_sessions; i++)
         session_close(&proxy.sessions[i]);
     free(proxy.sessions);
-    close(proxy.listen_fd);
+    (void)nq_close_socket(proxy.listen_fd);
     return result;
 }

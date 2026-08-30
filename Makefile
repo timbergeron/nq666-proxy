@@ -5,7 +5,15 @@ CPPFLAGS ?=
 WARNINGS = -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow -Wstrict-prototypes \
 	-Wundef -Wwrite-strings -Wconversion -Wsign-conversion
 
-TARGET = nq666-proxy
+EXEEXT =
+ifeq ($(OS),Windows_NT)
+EXEEXT = .exe
+LDLIBS += -lws2_32
+endif
+
+TARGET = nq666-proxy$(EXEEXT)
+TEST_TARGET = tests$(EXEEXT)
+INTEGRATION_TARGET = integration_test$(EXEEXT)
 OBJECTS = main.o netchan.o protocol.o
 SANITIZER_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer
 
@@ -16,26 +24,26 @@ all: $(TARGET)
 $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
 
-main.o: main.c netchan.h protocol.h
+main.o: main.c netchan.h protocol.h socket_compat.h
 netchan.o: netchan.c netchan.h
 protocol.o: protocol.c protocol.h
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -std=c11 -c -o $@ $<
 
-tests: tests.c netchan.c protocol.c netchan.h protocol.h
+$(TEST_TARGET): tests.c netchan.c protocol.c netchan.h protocol.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -Werror -std=c11 \
-		-o $@ tests.c netchan.c protocol.c
+		-o $@ tests.c netchan.c protocol.c $(LDLIBS)
 
-test: tests
-	./tests
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)
 
-integration_test: integration_test.c netchan.h $(TARGET)
+$(INTEGRATION_TARGET): integration_test.c netchan.h socket_compat.h $(TARGET)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -Werror -std=c11 \
-		-o $@ integration_test.c
+		-o $@ integration_test.c $(LDLIBS)
 
-integration-test: integration_test
-	./integration_test
+integration-test: $(INTEGRATION_TARGET)
+	./$(INTEGRATION_TARGET)
 
 check: test integration-test
 
@@ -44,7 +52,8 @@ tests-sanitize: tests.c netchan.c protocol.c netchan.h protocol.h
 		$(SANITIZER_FLAGS) \
 		-o $@ tests.c netchan.c protocol.c
 
-nq666-proxy-sanitize: main.c netchan.c protocol.c netchan.h protocol.h
+nq666-proxy-sanitize: main.c netchan.c protocol.c netchan.h protocol.h \
+		socket_compat.h
 	$(CC) $(CPPFLAGS) -O1 -g $(WARNINGS) -Werror -std=c11 \
 		$(SANITIZER_FLAGS) \
 		-o $@ main.c netchan.c protocol.c
@@ -67,5 +76,6 @@ install: $(TARGET)
 		$(DESTDIR)/usr/local/share/doc/nq666-proxy/nq666-proxy.default
 
 clean:
-	rm -f $(TARGET) $(OBJECTS) tests integration_test tests-sanitize \
+	rm -f nq666-proxy nq666-proxy.exe $(OBJECTS) tests tests.exe \
+		integration_test integration_test.exe tests-sanitize \
 		nq666-proxy-sanitize

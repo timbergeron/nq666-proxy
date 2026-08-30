@@ -2,26 +2,28 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "netchan.h"
+#include "socket_compat.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/types.h>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
-        fprintf(stderr, "integration FAIL %s:%d: %s (errno %d)\n", \
-                __FILE__, __LINE__, #condition, errno); \
+        fprintf(stderr, \
+                "integration FAIL %s:%d: %s (socket error %d, errno %d)\n", \
+                __FILE__, __LINE__, #condition, nq_socket_last_error(), \
+                errno); \
         goto cleanup; \
     } \
 } while (0)
@@ -54,29 +56,30 @@ static void put_string(uint8_t **p, const char *string)
     *p += len;
 }
 
-static int bind_loopback(uint16_t *port)
+static nq_socket_t bind_loopback(uint16_t *port)
 {
     struct sockaddr_in address;
-    struct timeval timeout = {2, 0};
-    socklen_t address_len = sizeof(address);
-    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0)
-        return -1;
+    nq_socklen_t address_len = (nq_socklen_t)sizeof(address);
+    nq_socket_t fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == NQ_INVALID_SOCKET)
+        return NQ_INVALID_SOCKET;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = 0;
-    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        getsockname(fd, (struct sockaddr *)&address, &address_len) != 0 ||
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
-        close(fd);
-        return -1;
+    if (nq_socket_bind(fd, (struct sockaddr *)&address,
+                       (nq_socklen_t)sizeof(address)) != 0 ||
+        nq_socket_getsockname(fd, (struct sockaddr *)&address,
+                              &address_len) != 0 ||
+        nq_socket_set_receive_timeout(fd, 2000u) != 0) {
+        (void)nq_close_socket(fd);
+        return NQ_INVALID_SOCKET;
     }
     *port = ntohs(address.sin_port);
     return fd;
 }
 
-static bool wait_readable(int fd, long microseconds)
+static bool wait_readable(nq_socket_t fd, long microseconds)
 {
     fd_set read_fds;
     struct timeval timeout = {
@@ -86,8 +89,53 @@ static bool wait_readable(int fd, long microseconds)
 
     FD_ZERO(&read_fds);
     FD_SET(fd, &read_fds);
-    return select(fd + 1, &read_fds, NULL, NULL, &timeout) > 0;
+    return nq_socket_select(fd, &read_fds, &timeout) > 0;
 }
+
+#ifdef _WIN32
+
+typedef intptr_t nq_process_t;
+
+static nq_process_t start_proxy(const char *program, const char *server,
+                                const char *listen, const char *advertise)
+{
+    return _spawnl(_P_NOWAIT, program, "nq666-proxy", "--server", server,
+                   "--listen", listen, "--advertise", advertise,
+                   (char *)NULL);
+}
+
+static void stop_proxy(nq_process_t process)
+{
+    HANDLE handle = (HANDLE)process;
+    (void)TerminateProcess(handle, 0);
+    (void)WaitForSingleObject(handle, 5000);
+    (void)CloseHandle(handle);
+}
+
+#else
+
+typedef pid_t nq_process_t;
+
+static nq_process_t start_proxy(const char *program, const char *server,
+                                const char *listen, const char *advertise)
+{
+    pid_t process = fork();
+    if (process == 0) {
+        execl(program, "nq666-proxy", "--server", server,
+              "--listen", listen, "--advertise", advertise,
+              (char *)NULL);
+        _exit(127);
+    }
+    return process;
+}
+
+static void stop_proxy(nq_process_t process)
+{
+    (void)kill(process, SIGTERM);
+    (void)waitpid(process, NULL, 0);
+}
+
+#endif
 
 static void make_reliable(uint8_t *packet, size_t *packet_len,
                           uint32_t sequence, const uint8_t *payload,
@@ -111,14 +159,14 @@ int main(void)
     uint16_t server_port = 0;
     uint16_t proxy_port = 0;
     uint16_t unused_port = 0;
-    int server_fd = -1;
-    int reservation_fd = -1;
-    int client_fd = -1;
-    pid_t proxy_pid = -1;
+    nq_socket_t server_fd = NQ_INVALID_SOCKET;
+    nq_socket_t reservation_fd = NQ_INVALID_SOCKET;
+    nq_socket_t client_fd = NQ_INVALID_SOCKET;
+    nq_process_t proxy_process = (nq_process_t)-1;
     int result = 1;
     struct sockaddr_in proxy_address;
     struct sockaddr_in upstream_peer;
-    socklen_t peer_len;
+    nq_socklen_t peer_len;
     char server_arg[64];
     char listen_arg[64];
     char advertise_arg[64];
@@ -128,37 +176,39 @@ int main(void)
     uint8_t payload[1024];
     uint8_t *p;
     size_t packet_len;
-    ssize_t received;
+    int received;
     bool got_server_ack = false;
     bool got_pext = false;
     unsigned int attempt;
 
     if (!proxy_program || !proxy_program[0])
+#ifdef _WIN32
+        proxy_program = "./nq666-proxy.exe";
+#else
         proxy_program = "./nq666-proxy";
+#endif
+
+    CHECK(nq_socket_startup() == 0);
+    CHECK(atexit(nq_socket_cleanup) == 0);
 
     server_fd = bind_loopback(&server_port);
-    CHECK(server_fd >= 0);
+    CHECK(server_fd != NQ_INVALID_SOCKET);
     reservation_fd = bind_loopback(&unused_port);
-    CHECK(reservation_fd >= 0);
+    CHECK(reservation_fd != NQ_INVALID_SOCKET);
     proxy_port = unused_port;
-    close(reservation_fd);
-    reservation_fd = -1;
+    (void)nq_close_socket(reservation_fd);
+    reservation_fd = NQ_INVALID_SOCKET;
 
     (void)snprintf(server_arg, sizeof(server_arg), "127.0.0.1:%u", server_port);
     (void)snprintf(listen_arg, sizeof(listen_arg), "127.0.0.1:%u", proxy_port);
     (void)snprintf(advertise_arg, sizeof(advertise_arg), "198.51.100.20");
     (void)snprintf(advertised_expected, sizeof(advertised_expected),
                    "198.51.100.20:%u", proxy_port);
-    proxy_pid = fork();
-    CHECK(proxy_pid >= 0);
-    if (proxy_pid == 0) {
-        execl(proxy_program, "nq666-proxy", "--server", server_arg,
-              "--listen", listen_arg, "--advertise", advertise_arg,
-              (char *)NULL);
-        _exit(127);
-    }
+    proxy_process = start_proxy(proxy_program, server_arg, listen_arg,
+                                advertise_arg);
+    CHECK(proxy_process != (nq_process_t)-1);
     client_fd = bind_loopback(&unused_port);
-    CHECK(client_fd >= 0);
+    CHECK(client_fd != NQ_INVALID_SOCKET);
     memset(&proxy_address, 0, sizeof(proxy_address));
     proxy_address.sin_family = AF_INET;
     proxy_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -172,16 +222,18 @@ int main(void)
     packet_len = (size_t)(p - packet);
     put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
     for (attempt = 0; attempt < 40; attempt++) {
-        CHECK(sendto(client_fd, packet, packet_len, 0,
-                     (struct sockaddr *)&proxy_address,
-                     sizeof(proxy_address)) == (ssize_t)packet_len);
+        CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                               (struct sockaddr *)&proxy_address,
+                               (nq_socklen_t)sizeof(proxy_address)) ==
+              (int)packet_len);
         if (wait_readable(server_fd, 50000L))
             break;
     }
     CHECK(attempt < 40);
     peer_len = sizeof(upstream_peer);
-    received = recvfrom(server_fd, packet, sizeof(packet), 0,
-                        (struct sockaddr *)&upstream_peer, &peer_len);
+    received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                  (struct sockaddr *)&upstream_peer,
+                                  &peer_len);
     CHECK(received >= 12 && packet[4] == 2);
     p = packet + 4;
     *p++ = 0x83;
@@ -193,10 +245,11 @@ int main(void)
     *p++ = 3;
     packet_len = (size_t)(p - packet);
     put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
-    CHECK(sendto(server_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&upstream_peer,
-                 sizeof(upstream_peer)) == (ssize_t)packet_len);
-    received = recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) ==
+          (int)packet_len);
+    received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
     CHECK(received > 6 && packet[4] == 0x83);
     CHECK(!strcmp((char *)packet + 5, advertised_expected));
 
@@ -204,9 +257,10 @@ int main(void)
     packet_len = 5;
     packet[4] = 5;
     put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
-    CHECK(sendto(client_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&proxy_address,
-                 sizeof(proxy_address)) == (ssize_t)packet_len);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) ==
+          (int)packet_len);
     CHECK(!wait_readable(server_fd, 100000L));
 
     /* An oversized handshake is rejected without consuming a player slot. */
@@ -216,10 +270,10 @@ int main(void)
     put_string(&p, "QUAKE");
     *p++ = 3;
     put_be32(packet, NQ_NETFLAG_CTL | 1025u);
-    CHECK(sendto(client_fd, packet, 1025, 0,
-                 (struct sockaddr *)&proxy_address,
-                 sizeof(proxy_address)) == 1025);
-    received = recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(nq_socket_sendto(client_fd, packet, 1025, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == 1025);
+    received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
     CHECK(received > 5 && packet[4] == 0x82);
 
     /* Normal NetQuake connection handshake. */
@@ -229,13 +283,15 @@ int main(void)
     *p++ = 3;
     packet_len = (size_t)(p - packet);
     put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
-    CHECK(sendto(client_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&proxy_address,
-                 sizeof(proxy_address)) == (ssize_t)packet_len);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) ==
+          (int)packet_len);
 
     peer_len = sizeof(upstream_peer);
-    received = recvfrom(server_fd, packet, sizeof(packet), 0,
-                        (struct sockaddr *)&upstream_peer, &peer_len);
+    received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                  (struct sockaddr *)&upstream_peer,
+                                  &peer_len);
     CHECK(received >= 12 && packet[4] == 1);
 
     /* Reject an impossible game port, then allow a clean retry. */
@@ -244,10 +300,11 @@ int main(void)
     put_le32(&p, 70000u);
     packet_len = (size_t)(p - packet);
     put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
-    CHECK(sendto(server_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&upstream_peer,
-                 sizeof(upstream_peer)) == (ssize_t)packet_len);
-    received = recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) ==
+          (int)packet_len);
+    received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
     CHECK(received > 5 && packet[4] == 0x82);
 
     p = packet + 4;
@@ -256,12 +313,14 @@ int main(void)
     *p++ = 3;
     packet_len = (size_t)(p - packet);
     put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
-    CHECK(sendto(client_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&proxy_address,
-                 sizeof(proxy_address)) == (ssize_t)packet_len);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) ==
+          (int)packet_len);
     peer_len = sizeof(upstream_peer);
-    received = recvfrom(server_fd, packet, sizeof(packet), 0,
-                        (struct sockaddr *)&upstream_peer, &peer_len);
+    received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                  (struct sockaddr *)&upstream_peer,
+                                  &peer_len);
     CHECK(received >= 12 && packet[4] == 1);
 
     p = packet + 4;
@@ -269,11 +328,12 @@ int main(void)
     put_le32(&p, server_port);
     packet_len = (size_t)(p - packet);
     put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
-    CHECK(sendto(server_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&upstream_peer,
-                 sizeof(upstream_peer)) == (ssize_t)packet_len);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) ==
+          (int)packet_len);
 
-    received = recv(client_fd, packet, sizeof(packet), 0);
+    received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
     CHECK(received == 9 && packet[4] == 0x81);
     CHECK((uint16_t)(packet[5] | ((uint16_t)packet[6] << 8)) == proxy_port);
 
@@ -281,31 +341,34 @@ int main(void)
     *p++ = 9;
     put_string(&p, "cmd pext\n");
     make_reliable(packet, &packet_len, 0, payload, (size_t)(p - payload));
-    CHECK(sendto(server_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&upstream_peer,
-                 sizeof(upstream_peer)) == (ssize_t)packet_len);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) ==
+          (int)packet_len);
 
-    received = recv(client_fd, packet, sizeof(packet), 0);
+    received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
     CHECK(received > 8);
     CHECK((get_be32(packet) & (NQ_NETFLAG_DATA | NQ_NETFLAG_EOM)) ==
           (NQ_NETFLAG_DATA | NQ_NETFLAG_EOM));
     CHECK(packet[8] == 9 && !strcmp((char *)packet + 9, "cmd pext\n"));
     make_ack(packet, 0);
-    CHECK(sendto(client_fd, packet, 8, 0,
-                 (struct sockaddr *)&proxy_address,
-                 sizeof(proxy_address)) == 8);
+    CHECK(nq_socket_sendto(client_fd, packet, 8, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == 8);
 
     p = payload;
     *p++ = 4;
     put_string(&p, "pext 123 456");
     make_reliable(packet, &packet_len, 0, payload, (size_t)(p - payload));
-    CHECK(sendto(client_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&proxy_address,
-                 sizeof(proxy_address)) == (ssize_t)packet_len);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) ==
+          (int)packet_len);
 
     while (!got_server_ack || !got_pext) {
-        received = recvfrom(server_fd, packet, sizeof(packet), 0,
-                            (struct sockaddr *)&upstream_peer, &peer_len);
+        received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                      (struct sockaddr *)&upstream_peer,
+                                      &peer_len);
         CHECK(received >= 8);
         if ((get_be32(packet) & ~NQ_NETFLAG_LENGTH_MASK) == NQ_NETFLAG_ACK) {
             got_server_ack = true;
@@ -313,9 +376,10 @@ int main(void)
             CHECK(packet[8] == 4 && !strcmp((char *)packet + 9, "pext"));
             got_pext = true;
             make_ack(packet, 0);
-            CHECK(sendto(server_fd, packet, 8, 0,
-                         (struct sockaddr *)&upstream_peer,
-                         sizeof(upstream_peer)) == 8);
+            CHECK(nq_socket_sendto(
+                      server_fd, packet, 8, 0,
+                      (struct sockaddr *)&upstream_peer,
+                      (nq_socklen_t)sizeof(upstream_peer)) == 8);
         }
     }
 
@@ -332,12 +396,13 @@ int main(void)
     *p++ = 25;
     *p++ = 1;
     make_reliable(packet, &packet_len, 1, payload, (size_t)(p - payload));
-    CHECK(sendto(server_fd, packet, packet_len, 0,
-                 (struct sockaddr *)&upstream_peer,
-                 sizeof(upstream_peer)) == (ssize_t)packet_len);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) ==
+          (int)packet_len);
 
     for (;;) {
-        received = recv(client_fd, packet, sizeof(packet), 0);
+        received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
         CHECK(received >= 8);
         if ((get_be32(packet) & NQ_NETFLAG_DATA) != 0)
             break;
@@ -346,22 +411,21 @@ int main(void)
     CHECK(packet[9] == 15 && packet[10] == 0 &&
           packet[11] == 0 && packet[12] == 0);
     make_ack(packet, 1);
-    (void)sendto(client_fd, packet, 8, 0,
-                 (struct sockaddr *)&proxy_address, sizeof(proxy_address));
+    (void)nq_socket_sendto(client_fd, packet, 8, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address));
 
     result = 0;
     printf("process integration test passed\n");
 
 cleanup:
-    if (proxy_pid > 0) {
-        (void)kill(proxy_pid, SIGTERM);
-        (void)waitpid(proxy_pid, NULL, 0);
-    }
-    if (client_fd >= 0)
-        close(client_fd);
-    if (reservation_fd >= 0)
-        close(reservation_fd);
-    if (server_fd >= 0)
-        close(server_fd);
+    if (proxy_process != (nq_process_t)-1)
+        stop_proxy(proxy_process);
+    if (client_fd != NQ_INVALID_SOCKET)
+        (void)nq_close_socket(client_fd);
+    if (reservation_fd != NQ_INVALID_SOCKET)
+        (void)nq_close_socket(reservation_fd);
+    if (server_fd != NQ_INVALID_SOCKET)
+        (void)nq_close_socket(server_fd);
     return result;
 }

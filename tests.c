@@ -2,7 +2,11 @@
 #include "netchan.h"
 #include "protocol.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -239,6 +243,134 @@ static bool test_baseline2(void)
     return true;
 }
 
+static bool test_clientdata_hides_unavailable_weapon_model(void)
+{
+    enum {
+        SU_WEAPON = 1 << 14,
+        SU_EXTEND1 = 1 << 15,
+        SU_WEAPON2 = 1 << 16
+    };
+    uint8_t input[32];
+    uint8_t *p = input;
+    struct nq_xlat_state state;
+    struct nq_batch batch;
+    char error[128];
+    const uint8_t *out;
+
+    *p++ = 15;
+    put_u16(&p, SU_WEAPON | SU_EXTEND1);
+    *p++ = (uint8_t)(SU_WEAPON2 >> 16);
+    put_u32(&p, 0); /* items */
+    *p++ = 2;       /* weapon model low: must not become model 2 */
+    put_u16(&p, 100);
+    *p++ = 10;
+    *p++ = 20;
+    *p++ = 30;
+    *p++ = 40;
+    *p++ = 50;
+    *p++ = 1;
+    *p++ = 1;       /* weapon model high: full index 258 */
+
+    nq_xlat_init(&state, false);
+    state.models_exposed = 3;
+    nq_batch_init(&batch);
+    CHECK(nq_translate_server_message(&state, input, (size_t)(p - input),
+                                      false, &batch, error, sizeof(error)));
+    CHECK(batch.count == 1 && batch.items[0].len == 16);
+    out = batch.items[0].data;
+    CHECK(out[0] == 15);
+    CHECK(out[1] == 0 && out[2] == 0x40);
+    CHECK(out[7] == 0);
+    nq_batch_free(&batch);
+    return true;
+}
+
+static bool test_setview_entity_limit(void)
+{
+    uint8_t input[8];
+    uint8_t *p = input;
+    struct nq_xlat_state state;
+    struct nq_batch batch;
+    char error[128];
+    const uint8_t expected[] = {5, 0x57, 0x02, 1};
+
+    *p++ = 5;
+    put_u16(&p, 599);
+    *p++ = 5;
+    put_u16(&p, 600);
+    *p++ = 1;
+
+    nq_xlat_init(&state, false);
+    nq_batch_init(&batch);
+    CHECK(nq_translate_server_message(&state, input, (size_t)(p - input),
+                                      true, &batch, error, sizeof(error)));
+    CHECK(batch.count == 1 && batch.items[0].len == sizeof(expected));
+    CHECK(memcmp(batch.items[0].data, expected, sizeof(expected)) == 0);
+    nq_batch_free(&batch);
+    return true;
+}
+
+static bool test_colormap_scoreboard_limit(void)
+{
+    enum { U_MOREBITS = 1 << 0, U_COLORMAP = 1 << 11 };
+    uint8_t input[32];
+    uint8_t *p = input;
+    struct nq_xlat_state state;
+    struct nq_batch batch;
+    char error[128];
+    const uint8_t *out;
+    int i;
+
+    *p++ = 22;
+    put_u16(&p, 17);
+    *p++ = 1;
+    *p++ = 0;
+    *p++ = 5; /* baseline colormap exceeds four-player scoreboard */
+    *p++ = 0;
+    for (i = 0; i < 3; i++) {
+        put_u16(&p, 0);
+        *p++ = 0;
+    }
+    *p++ = (uint8_t)(0x80 | U_MOREBITS);
+    *p++ = (uint8_t)(U_COLORMAP >> 8);
+    *p++ = 17;
+    *p++ = 5; /* delta colormap exceeds four-player scoreboard */
+
+    nq_xlat_init(&state, false);
+    state.max_scoreboard = 4;
+    nq_batch_init(&batch);
+    CHECK(nq_translate_server_message(&state, input, (size_t)(p - input),
+                                      true, &batch, error, sizeof(error)));
+    CHECK(batch.count == 1 && batch.items[0].len == 20);
+    out = batch.items[0].data;
+    CHECK(out[5] == 0);
+    CHECK(out[19] == 0);
+    nq_batch_free(&batch);
+    return true;
+}
+
+static bool test_lightstyle_limit(void)
+{
+    static const uint8_t input[] = {
+        12, 63, 'a', 0,
+        12, 64, 'b', 0,
+        1
+    };
+    static const uint8_t expected[] = {12, 63, 'a', 0, 1};
+    struct nq_xlat_state state;
+    struct nq_batch batch;
+    char error[128];
+
+    nq_xlat_init(&state, false);
+    nq_batch_init(&batch);
+    CHECK(nq_translate_server_message(&state, input, sizeof(input), true,
+                                      &batch, error, sizeof(error)));
+    CHECK(batch.count == 1 && batch.items[0].len == sizeof(expected));
+    CHECK(memcmp(batch.items[0].data, expected, sizeof(expected)) == 0);
+    nq_batch_free(&batch);
+    return true;
+}
+
 static bool test_unreliable_chunking(void)
 {
     uint8_t input[1500];
@@ -263,7 +395,7 @@ struct capture {
     unsigned int sends;
 };
 
-static ssize_t capture_send(void *opaque, const void *packet, size_t len)
+static int capture_send(void *opaque, const void *packet, size_t len)
 {
     struct capture *capture = opaque;
     if (len > sizeof(capture->packet))
@@ -271,7 +403,7 @@ static ssize_t capture_send(void *opaque, const void *packet, size_t len)
     memcpy(capture->packet, packet, len);
     capture->len = len;
     capture->sends++;
-    return (ssize_t)len;
+    return (int)len;
 }
 
 static bool test_reliable_fragmentation(void)
@@ -341,6 +473,36 @@ static bool test_oversized_reliable_is_fully_discarded(void)
     CHECK(nq_chan_receive(&receiver, valid, sizeof(valid), 1.3, &message));
     CHECK(message.kind == NQ_MESSAGE_RELIABLE && message.len == 1);
     CHECK(message.data[0] == 0x44);
+    nq_chan_destroy(&receiver);
+    return true;
+}
+
+static bool test_maximum_reliable_message(void)
+{
+    static uint8_t first[40008];
+    static uint8_t last[25543];
+    struct nq_chan receiver;
+    struct capture ack = {{0}, 0, 0};
+    struct nq_received_message message;
+
+    memset(first + 8, 0x11, sizeof(first) - 8);
+    put_be32(first, NQ_NETFLAG_DATA | (uint32_t)sizeof(first));
+    put_be32(first + 4, 0);
+    memset(last + 8, 0x22, sizeof(last) - 8);
+    put_be32(last, NQ_NETFLAG_DATA | NQ_NETFLAG_EOM |
+                   (uint32_t)sizeof(last));
+    put_be32(last + 4, 1);
+
+    nq_chan_init(&receiver, 1024, capture_send, &ack);
+    CHECK(nq_chan_receive(&receiver, first, sizeof(first), 1.0, &message));
+    CHECK(message.kind == NQ_MESSAGE_NONE);
+    CHECK(nq_chan_receive(&receiver, last, sizeof(last), 1.1, &message));
+    CHECK(message.kind == NQ_MESSAGE_RELIABLE);
+    CHECK(message.len == NQ_MAX_RELIABLE_MESSAGE);
+    CHECK(message.data[0] == 0x11);
+    CHECK(message.data[39999] == 0x11);
+    CHECK(message.data[40000] == 0x22);
+    CHECK(message.data[NQ_MAX_RELIABLE_MESSAGE - 1] == 0x22);
     nq_chan_destroy(&receiver);
     return true;
 }
@@ -442,9 +604,14 @@ int main(void)
         test_proquake_angles_preserved,
         test_pext_is_sanitized,
         test_baseline2,
+        test_clientdata_hides_unavailable_weapon_model,
+        test_setview_entity_limit,
+        test_colormap_scoreboard_limit,
+        test_lightstyle_limit,
         test_unreliable_chunking,
         test_reliable_fragmentation,
         test_oversized_reliable_is_fully_discarded,
+        test_maximum_reliable_message,
         test_stop_sound_entity_limit,
         test_failed_message_preserves_state,
         test_malformed_packet_fuzz
