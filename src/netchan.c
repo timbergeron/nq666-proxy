@@ -28,13 +28,17 @@ static void write_be32(uint8_t *p, uint32_t value)
     memcpy(p, &value, sizeof(value));
 }
 
-void nq_chan_init(struct nq_chan *chan, size_t mss,
+void nq_chan_init(struct nq_chan *chan, size_t mss, size_t max_message,
                   nq_send_packet_fn send_packet, void *send_opaque)
 {
     memset(chan, 0, sizeof(*chan));
     chan->mss = mss > NQ_MAX_WIRE_PAYLOAD ? NQ_MAX_WIRE_PAYLOAD : mss;
     if (!chan->mss)
         chan->mss = 1;
+    chan->max_message = max_message > NQ_MAX_RELIABLE_MESSAGE ?
+                        NQ_MAX_RELIABLE_MESSAGE : max_message;
+    if (!chan->max_message)
+        chan->max_message = 1;
     chan->max_queue_bytes = 512u * 1024u;
     chan->send_packet = send_packet;
     chan->send_opaque = send_opaque;
@@ -85,7 +89,8 @@ bool nq_chan_queue_reliable(struct nq_chan *chan, const uint8_t *data,
 {
     struct nq_queued_message *message;
 
-    if (!len || len > NQ_MAX_RELIABLE_MESSAGE ||
+    if (!len || len > chan->max_message ||
+        chan->queued_bytes > chan->max_queue_bytes ||
         len > chan->max_queue_bytes - chan->queued_bytes)
         return false;
 
@@ -214,7 +219,8 @@ bool nq_chan_receive(struct nq_chan *chan, const uint8_t *packet,
         return true;
     }
 
-    if (payload_len > sizeof(chan->receive_message) - chan->receive_message_len) {
+    if (chan->receive_message_len > chan->max_message ||
+        payload_len > chan->max_message - chan->receive_message_len) {
         chan->receive_message_len = 0;
         chan->receive_discarding = (flags & NQ_NETFLAG_EOM) == 0;
         return false;

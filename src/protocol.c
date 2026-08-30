@@ -912,13 +912,26 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 ok = copy_n(&writer, &reader, 4);
                 break;
             case SVC_PRINT:
-            case SVC_STUFFTEXT:
             case SVC_CENTERPRINT:
             case SVC_FINALE:
             case SVC_CUTSCENE:
                 writer_u8(&writer, command);
                 writer_input_string(&writer, &reader);
                 break;
+            case SVC_STUFFTEXT: {
+                static const uint8_t download_extension[] =
+                    "cl_serverextension_download 1\n";
+                size_t wire_len;
+                const uint8_t *string = reader_string(&reader, &wire_len);
+                if (string && wire_len == sizeof(download_extension) &&
+                    memcmp(string, download_extension, wire_len) == 0) {
+                    keep = false;
+                } else if (string) {
+                    writer_u8(&writer, command);
+                    writer_bytes(&writer, string, wire_len);
+                }
+                break;
+            }
             case SVC_SETANGLE:
                 writer_u8(&writer, command);
                 ok = copy_n(&writer, &reader, 3);
@@ -1064,7 +1077,7 @@ bool nq_translate_client_message(const struct nq_xlat_state *state,
                                  char *error, size_t error_size)
 {
     struct reader reader = {input, input_len, 0, false};
-    size_t chunk_limit = reliable ? 32000u : 1442u;
+    size_t chunk_limit = reliable ? NQ_UPSTREAM_RELIABLE_MAX : 1442u;
 
     if (error && error_size)
         error[0] = 0;

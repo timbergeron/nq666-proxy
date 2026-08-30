@@ -158,6 +158,16 @@ static void make_ack(uint8_t packet[8], uint32_t sequence)
     put_be32(packet + 4, sequence);
 }
 
+static void make_unreliable(uint8_t *packet, size_t *packet_len,
+                            uint32_t sequence, const uint8_t *payload,
+                            size_t payload_len)
+{
+    *packet_len = 8 + payload_len;
+    put_be32(packet, NQ_NETFLAG_UNRELIABLE | (uint32_t)*packet_len);
+    put_be32(packet + 4, sequence);
+    memcpy(packet + 8, payload, payload_len);
+}
+
 int main(void)
 {
     uint16_t server_port = 0;
@@ -330,6 +340,7 @@ int main(void)
     p = packet + 4;
     *p++ = 0x81;
     put_le32(&p, server_port);
+    *p++ = 1;
     packet_len = (size_t)(p - packet);
     put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)packet_len);
     CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
@@ -338,8 +349,31 @@ int main(void)
           (int)packet_len);
 
     received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
-    CHECK(received == 9 && packet[4] == 0x81);
+    CHECK(received == 10 && packet[4] == 0x81 && packet[9] == 1);
     CHECK((uint16_t)(packet[5] | ((uint16_t)packet[6] << 8)) == proxy_port);
+
+    /* ProQuake's mod byte alone enables its 16-bit client angles. */
+    memset(payload, 0, 19);
+    payload[0] = 3;
+    payload[5] = 0x34;
+    payload[6] = 0x12;
+    payload[7] = 0x78;
+    payload[8] = 0x56;
+    payload[9] = 0xbc;
+    payload[10] = 0x9a;
+    make_unreliable(packet, &packet_len, 0, payload, 19);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) ==
+          (int)packet_len);
+    peer_len = (nq_socklen_t)sizeof(upstream_peer);
+    received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                  (struct sockaddr *)&upstream_peer,
+                                  &peer_len);
+    CHECK(received == 27);
+    CHECK((get_be32(packet) & ~NQ_NETFLAG_LENGTH_MASK) ==
+          NQ_NETFLAG_UNRELIABLE);
+    CHECK(memcmp(packet + 8, payload, 19) == 0);
 
     p = payload;
     *p++ = 9;

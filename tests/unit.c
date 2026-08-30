@@ -206,6 +206,27 @@ static bool test_pext_is_sanitized(void)
     return true;
 }
 
+static bool test_download_extension_stufftext_is_filtered(void)
+{
+    static const uint8_t input[] = {
+        9, 'c','l','_','s','e','r','v','e','r','e','x','t','e','n','s','i','o','n','_',
+        'd','o','w','n','l','o','a','d',' ','1','\n', 0,
+        1
+    };
+    struct nq_xlat_state state;
+    struct nq_batch batch;
+    char error[128];
+
+    nq_xlat_init(&state, false);
+    nq_batch_init(&batch);
+    CHECK(nq_translate_server_message(&state, input, sizeof(input), true,
+                                      &batch, error, sizeof(error)));
+    CHECK(batch.count == 1 && batch.items[0].len == 1);
+    CHECK(batch.items[0].data[0] == 1);
+    nq_batch_free(&batch);
+    return true;
+}
+
 static bool test_baseline2(void)
 {
     uint8_t input[64];
@@ -418,8 +439,10 @@ static bool test_reliable_fragmentation(void)
 
     for (i = 0; i < sizeof(payload); i++)
         payload[i] = (uint8_t)i;
-    nq_chan_init(&sender, 1024, capture_send, &sent);
-    nq_chan_init(&receiver, 1024, capture_send, &ack);
+    nq_chan_init(&sender, 1024, NQ_MAX_RELIABLE_MESSAGE,
+                 capture_send, &sent);
+    nq_chan_init(&receiver, 1024, NQ_MAX_RELIABLE_MESSAGE,
+                 capture_send, &ack);
     CHECK(nq_chan_queue_reliable(&sender, payload, sizeof(payload), 1.0));
     CHECK(sent.sends == 1 && sent.len == 1032);
     CHECK(nq_chan_receive(&receiver, sent.packet, sent.len, 1.0, &message));
@@ -461,7 +484,8 @@ static bool test_oversized_reliable_is_fully_discarded(void)
     put_be32(valid + 4, 3);
     valid[8] = 0x44;
 
-    nq_chan_init(&receiver, 1024, capture_send, &ack);
+    nq_chan_init(&receiver, 1024, NQ_MAX_RELIABLE_MESSAGE,
+                 capture_send, &ack);
     CHECK(nq_chan_receive(&receiver, first, sizeof(first), 1.0, &message));
     CHECK(message.kind == NQ_MESSAGE_NONE);
     CHECK(!nq_chan_receive(&receiver, overflow, sizeof(overflow),
@@ -493,7 +517,8 @@ static bool test_maximum_reliable_message(void)
                    (uint32_t)sizeof(last));
     put_be32(last + 4, 1);
 
-    nq_chan_init(&receiver, 1024, capture_send, &ack);
+    nq_chan_init(&receiver, 1024, NQ_MAX_RELIABLE_MESSAGE,
+                 capture_send, &ack);
     CHECK(nq_chan_receive(&receiver, first, sizeof(first), 1.0, &message));
     CHECK(message.kind == NQ_MESSAGE_NONE);
     CHECK(nq_chan_receive(&receiver, last, sizeof(last), 1.1, &message));
@@ -503,6 +528,55 @@ static bool test_maximum_reliable_message(void)
     CHECK(message.data[39999] == 0x11);
     CHECK(message.data[40000] == 0x22);
     CHECK(message.data[NQ_MAX_RELIABLE_MESSAGE - 1] == 0x22);
+    nq_chan_destroy(&receiver);
+    return true;
+}
+
+static bool test_legacy_reliable_message_limit(void)
+{
+    static uint8_t exact[NQ_LEGACY_RELIABLE_MAX];
+    static uint8_t oversized[NQ_LEGACY_RELIABLE_MAX + 1];
+    static uint8_t exact_packet[NQ_NET_HEADERSIZE +
+                                NQ_LEGACY_RELIABLE_MAX];
+    static uint8_t oversized_packet[NQ_NET_HEADERSIZE +
+                                    NQ_LEGACY_RELIABLE_MAX + 1];
+    uint8_t valid_packet[NQ_NET_HEADERSIZE + 1];
+    struct nq_chan sender;
+    struct nq_chan receiver;
+    struct capture sent = {{0}, 0, 0};
+    struct capture ack = {{0}, 0, 0};
+    struct nq_received_message message;
+
+    nq_chan_init(&sender, 1024, NQ_LEGACY_RELIABLE_MAX,
+                 capture_send, &sent);
+    CHECK(nq_chan_queue_reliable(&sender, exact, sizeof(exact), 1.0));
+    CHECK(!nq_chan_queue_reliable(&sender, oversized, sizeof(oversized), 1.0));
+    nq_chan_destroy(&sender);
+
+    put_be32(exact_packet, NQ_NETFLAG_DATA | NQ_NETFLAG_EOM |
+                           (uint32_t)sizeof(exact_packet));
+    put_be32(exact_packet + 4, 0);
+    put_be32(oversized_packet, NQ_NETFLAG_DATA | NQ_NETFLAG_EOM |
+                               (uint32_t)sizeof(oversized_packet));
+    put_be32(oversized_packet + 4, 1);
+    put_be32(valid_packet, NQ_NETFLAG_DATA | NQ_NETFLAG_EOM |
+                           (uint32_t)sizeof(valid_packet));
+    put_be32(valid_packet + 4, 2);
+    valid_packet[8] = 0x44;
+
+    nq_chan_init(&receiver, 1024, NQ_LEGACY_RELIABLE_MAX,
+                 capture_send, &ack);
+    CHECK(nq_chan_receive(&receiver, exact_packet, sizeof(exact_packet),
+                          1.0, &message));
+    CHECK(message.kind == NQ_MESSAGE_RELIABLE &&
+          message.len == NQ_LEGACY_RELIABLE_MAX);
+    CHECK(!nq_chan_receive(&receiver, oversized_packet,
+                           sizeof(oversized_packet), 1.1, &message));
+    CHECK(message.kind == NQ_MESSAGE_NONE && !receiver.receive_discarding);
+    CHECK(nq_chan_receive(&receiver, valid_packet, sizeof(valid_packet),
+                          1.2, &message));
+    CHECK(message.kind == NQ_MESSAGE_RELIABLE && message.len == 1);
+    CHECK(message.data[0] == 0x44);
     nq_chan_destroy(&receiver);
     return true;
 }
@@ -603,6 +677,7 @@ int main(void)
         test_move_angle_expansion,
         test_proquake_angles_preserved,
         test_pext_is_sanitized,
+        test_download_extension_stufftext_is_filtered,
         test_baseline2,
         test_clientdata_hides_unavailable_weapon_model,
         test_setview_entity_limit,
@@ -612,6 +687,7 @@ int main(void)
         test_reliable_fragmentation,
         test_oversized_reliable_is_fully_discarded,
         test_maximum_reliable_message,
+        test_legacy_reliable_message_limit,
         test_stop_sound_entity_limit,
         test_failed_message_preserves_state,
         test_malformed_packet_fuzz

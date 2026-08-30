@@ -11,6 +11,7 @@
 
 #define NQ_LEGACY_RELIABLE_MAX 8192
 #define NQ_LEGACY_DATAGRAM_MAX 1024
+#define NQ_UPSTREAM_RELIABLE_MAX 32000
 
 struct nq_blob {
     uint8_t *data;

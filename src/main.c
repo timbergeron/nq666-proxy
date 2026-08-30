@@ -23,6 +23,10 @@
 #define SESSION_TIMEOUT 300.0
 #define HANDSHAKE_TIMEOUT 8.0
 #define QUERY_TIMEOUT 3.0
+#define TRANSLATION_ERROR_WINDOW 30.0
+#define TRANSLATION_ERROR_LIMIT 5
+#define MAX_ADVERTISE 256
+#define MAX_REWRITTEN_CONTROL_PACKET (MAX_CONTROL_PACKET + MAX_ADVERTISE)
 
 #define NET_PROTOCOL_VERSION 3
 #define CCREQ_CONNECT 0x01
@@ -68,6 +72,7 @@ struct session {
     size_t accept_reply_len;
     double created_at;
     double last_activity;
+    double last_translation_error;
     unsigned int translation_errors;
     unsigned int limit_warning_generation;
 };
@@ -77,7 +82,7 @@ struct proxy {
     struct sockaddr_in listen_address;
     struct sockaddr_in upstream_address;
     uint16_t listen_port;
-    char advertise[256];
+    char advertise[MAX_ADVERTISE];
     struct session *sessions;
     size_t max_sessions;
     bool verbose;
@@ -400,8 +405,10 @@ static void start_connection(struct proxy *proxy,
     session->upstream_target.connected = true;
     session->upstream_target.address = proxy->upstream_address;
     nq_chan_init(&session->client_chan, NQ_LEGACY_DATAGRAM_MAX,
+                 NQ_LEGACY_RELIABLE_MAX,
                  send_packet, &session->client_target);
-    nq_chan_init(&session->upstream_chan, 1442, send_packet,
+    nq_chan_init(&session->upstream_chan, 1442,
+                 NQ_UPSTREAM_RELIABLE_MAX, send_packet,
                  &session->upstream_target);
     nq_xlat_init(&session->xlat, false);
 
@@ -461,7 +468,8 @@ static void handle_frontend_control(struct proxy *proxy,
 
 static bool rewrite_server_info(const struct proxy *proxy,
                                 const uint8_t *input, size_t input_len,
-                                uint8_t *output, size_t *output_len)
+                                uint8_t *output, size_t output_size,
+                                size_t *output_len)
 {
     const uint8_t *nul;
     size_t old_string_len;
@@ -471,6 +479,8 @@ static bool rewrite_server_info(const struct proxy *proxy,
 
     if (!proxy->advertise[0] || input_len < 6 ||
         input[4] != CCREP_SERVER_INFO) {
+        if (input_len > output_size)
+            return false;
         memcpy(output, input, input_len);
         *output_len = input_len;
         return true;
@@ -482,7 +492,7 @@ static bool rewrite_server_info(const struct proxy *proxy,
     new_string_len = strlen(proxy->advertise) + 1;
     suffix_len = input_len - 5 - old_string_len;
     len = 5 + new_string_len + suffix_len;
-    if (len > 65535u)
+    if (len > output_size || len > NQ_NETFLAG_LENGTH_MASK)
         return false;
     write_be32(output, NQ_NETFLAG_CTL | (uint32_t)len);
     output[4] = input[4];
@@ -498,7 +508,7 @@ static void handle_pending_upstream(struct proxy *proxy,
                                     const uint8_t *packet, size_t packet_len,
                                     double now)
 {
-    uint8_t reply[65535];
+    uint8_t reply[MAX_CONTROL_PACKET];
     uint32_t accepted_port;
     bool ignore_port = false;
     bool client_angle16 = false;
@@ -535,9 +545,10 @@ static void handle_pending_upstream(struct proxy *proxy,
         session_close(session);
         return;
     }
-    if (packet_len >= 12 && packet[9] == MOD_PROQUAKE) {
-        ignore_port = (packet[11] & PQF_IGNOREPORT) != 0;
+    if (packet_len > 9 && packet[9] == MOD_PROQUAKE) {
         client_angle16 = true;
+        if (packet_len > 11)
+            ignore_port = (packet[11] & PQF_IGNOREPORT) != 0;
     }
     if (accepted_port && !ignore_port) {
         session->upstream_address.sin_port = htons((uint16_t)accepted_port);
@@ -627,12 +638,28 @@ static bool queue_limit_warning(struct session *session, double now)
     return true;
 }
 
+static bool record_translation_error(struct session *session, double now,
+                                     unsigned int penalty)
+{
+    if (session->translation_errors != 0 &&
+        now - session->last_translation_error > TRANSLATION_ERROR_WINDOW)
+        session->translation_errors = 0;
+    session->last_translation_error = now;
+    if (session->translation_errors >= TRANSLATION_ERROR_LIMIT ||
+        penalty >= TRANSLATION_ERROR_LIMIT - session->translation_errors)
+        session->translation_errors = TRANSLATION_ERROR_LIMIT;
+    else
+        session->translation_errors += penalty;
+    return session->translation_errors >= TRANSLATION_ERROR_LIMIT;
+}
+
 static void translate_client_packet(struct session *session,
                                     const struct nq_received_message *message,
                                     double now)
 {
     struct nq_batch batch;
     char error[256];
+    const char *close_reason = NULL;
     bool reliable = message->kind == NQ_MESSAGE_RELIABLE;
 
     nq_batch_init(&batch);
@@ -643,16 +670,15 @@ static void translate_client_packet(struct session *session,
         fprintf(stderr, "%s: legacy client message dropped: %s\n",
                 address_string(&session->client_address, address,
                                sizeof(address)), error);
-        session->translation_errors++;
+        if (record_translation_error(session, now, 1))
+            close_reason = "too many invalid client messages";
     } else if (!forward_batch(&session->upstream_chan, &batch, reliable, now)) {
-        fprintf(stderr, "upstream queue overflow\n");
-        session->translation_errors += 5;
+        close_reason = reliable ? "send queue to upstream is full" :
+                                  "could not send datagram upstream";
     }
     nq_batch_free(&batch);
-    if (session->translation_errors >= 5) {
-        notify_client_and_close(session,
-                                "too many invalid client messages");
-    }
+    if (close_reason)
+        notify_client_and_close(session, close_reason);
 }
 
 static void translate_server_packet(struct session *session,
@@ -661,6 +687,7 @@ static void translate_server_packet(struct session *session,
 {
     struct nq_batch batch;
     char error[256];
+    const char *close_reason = NULL;
     bool reliable = message->kind == NQ_MESSAGE_RELIABLE;
 
     nq_batch_init(&batch);
@@ -671,20 +698,19 @@ static void translate_server_packet(struct session *session,
         fprintf(stderr, "%s: protocol-666 message dropped: %s\n",
                 address_string(&session->client_address, address,
                                sizeof(address)), error);
-        session->translation_errors++;
-        if (!strncmp(error, "upstream ", 9))
-            session->translation_errors += 5;
+        unsigned int penalty = !strncmp(error, "upstream ", 9) ?
+                               TRANSLATION_ERROR_LIMIT : 1;
+        if (record_translation_error(session, now, penalty))
+            close_reason = "upstream protocol is incompatible";
     } else if (!forward_batch(&session->client_chan, &batch, reliable, now)) {
-        fprintf(stderr, "legacy client queue overflow\n");
-        session->translation_errors += 5;
+        close_reason = reliable ? "send queue to client is full" :
+                                  "could not send datagram to client";
     } else if (!queue_limit_warning(session, now)) {
-        session->translation_errors += 5;
+        close_reason = "send queue to client is full";
     }
     nq_batch_free(&batch);
-    if (session->translation_errors >= 5) {
-        notify_client_and_close(session,
-                                "upstream protocol is incompatible");
-    }
+    if (close_reason)
+        notify_client_and_close(session, close_reason);
 }
 
 static void handle_frontend_game(struct proxy *proxy,
@@ -782,12 +808,12 @@ static void receive_upstream(struct proxy *proxy, struct session *session,
             handle_pending_upstream(proxy, session, packet,
                                     (size_t)received, now);
         } else if (session->phase == SESSION_QUERY) {
-            uint8_t reply[65535];
+            uint8_t reply[MAX_REWRITTEN_CONTROL_PACKET];
             size_t reply_len;
             if ((size_t)received <= MAX_CONTROL_PACKET &&
                 nq_packet_is_control(packet, (size_t)received) &&
                 rewrite_server_info(proxy, packet, (size_t)received,
-                                    reply, &reply_len))
+                                    reply, sizeof(reply), &reply_len))
                 (void)nq_socket_sendto(
                     proxy->listen_fd, reply, reply_len, 0,
                     (const struct sockaddr *)&session->client_address,

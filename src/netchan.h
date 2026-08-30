@@ -54,12 +54,13 @@ struct nq_chan {
     bool fragment_waiting;
 
     size_t mss;
+    size_t max_message;
     size_t max_queue_bytes;
     nq_send_packet_fn send_packet;
     void *send_opaque;
 };
 
-void nq_chan_init(struct nq_chan *chan, size_t mss,
+void nq_chan_init(struct nq_chan *chan, size_t mss, size_t max_message,
                   nq_send_packet_fn send_packet, void *send_opaque);
 void nq_chan_destroy(struct nq_chan *chan);
 
