@@ -159,6 +159,14 @@ The proxy therefore applies conservative client limits:
 | Dynamic entities | 600 WinQuake / 2048 ProQuake | Higher entities are omitted |
 | Static entities | 128 | Additional statics are omitted |
 | Light styles | 64 | Higher style updates are omitted |
+| Player names | 31 characters | Longer names are truncated |
+| Light-style patterns | 63 characters | Longer patterns are truncated |
+| Model/sound paths | 63 characters | The precache list ends at the first unsupported path |
+
+Display text is truncated to fit the legacy string reader and datagram limits.
+Oversized console commands are rejected to avoid executing partial commands.
+A missing or oversized world-model path, or a zero-slot scoreboard, closes the
+connection with an incompatibility error.
 
 This is intended for standard Quake and similarly sized multiplayer maps. A
 map or mod that fundamentally requires FitzQuake limits may connect but will

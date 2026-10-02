@@ -116,6 +116,11 @@ enum {
 #define PROTOCOL_FTE_PEXT2 ((uint32_t)'F' | ((uint32_t)'T' << 8) | \
                             ((uint32_t)'E' << 16) | ((uint32_t)'2' << 24))
 #define NQ_LEGACY_LIGHTSTYLES 64u
+#define NQ_LEGACY_STYLESTRING 64u
+#define NQ_LEGACY_SCOREBOARDNAME 32u
+#define NQ_LEGACY_QPATH 64u
+/* MSG_ReadString stops after 2047 characters, before consuming the NUL. */
+#define NQ_LEGACY_STRING_WIRE_MAX 2047u
 
 struct reader {
     const uint8_t *data;
@@ -272,15 +277,15 @@ static void writer_u32(struct writer *writer, uint32_t value)
     writer_bytes(writer, bytes, sizeof(bytes));
 }
 
-static void writer_input_string(struct writer *writer, struct reader *reader)
+static void writer_string(struct writer *writer, const uint8_t *string,
+                           size_t len, size_t wire_limit)
 {
-    size_t len;
-    const uint8_t *string = reader_string(reader, &len);
-    size_t available;
+    size_t available = writer->limit - writer->len;
 
     if (!string)
         return;
-    available = writer->limit - writer->len;
+    if (available > wire_limit)
+        available = wire_limit;
     if (len <= available) {
         writer_bytes(writer, string, len);
         return;
@@ -292,6 +297,13 @@ static void writer_input_string(struct writer *writer, struct reader *reader)
     if (available > 1)
         writer_bytes(writer, string, available - 1);
     writer_u8(writer, 0);
+}
+
+static void writer_input_string(struct writer *writer, struct reader *reader)
+{
+    size_t len;
+    const uint8_t *string = reader_string(reader, &len);
+    writer_string(writer, string, len, NQ_LEGACY_STRING_WIRE_MAX);
 }
 
 static bool command_is_pext(const uint8_t *string, size_t wire_len)
@@ -440,6 +452,10 @@ static bool translate_serverinfo(struct nq_xlat_state *state,
 
     maxclients = reader_u8(reader);
     gametype = reader_u8(reader);
+    if (!maxclients && !reader->bad) {
+        set_error(error, error_size, "upstream reported zero scoreboard slots");
+        return false;
+    }
     state->max_scoreboard = maxclients > 16 ? 16 : maxclients;
     writer_u32(writer, NQ_PROTOCOL_NETQUAKE);
     writer_u8(writer, maxclients > 16 ? 16 : maxclients);
@@ -455,7 +471,13 @@ static bool translate_serverinfo(struct nq_xlat_state *state,
             return false;
         if (len == 1)
             break;
+        if (input_index == 1 && len > NQ_LEGACY_QPATH) {
+            set_error(error, error_size,
+                      "upstream world model path exceeds legacy limits");
+            return false;
+        }
         if (exposing && input_index < 256 &&
+            len <= NQ_LEGACY_QPATH &&
             writer->len + len + 1 <= model_budget) {
             writer_bytes(writer, string, len);
             output_next = input_index + 1;
@@ -467,6 +489,10 @@ static bool translate_serverinfo(struct nq_xlat_state *state,
     }
     writer_u8(writer, 0);
     state->models_exposed = output_next;
+    if (output_next == 1 && !reader->bad) {
+        set_error(error, error_size, "upstream did not provide a world model");
+        return false;
+    }
 
     input_index = 1;
     output_next = 1;
@@ -478,6 +504,7 @@ static bool translate_serverinfo(struct nq_xlat_state *state,
         if (len == 1)
             break;
         if (exposing && input_index < 256 &&
+            len <= NQ_LEGACY_QPATH &&
             writer->len + len + 1 <= sound_budget) {
             writer_bytes(writer, string, len);
             output_next = input_index + 1;
@@ -826,7 +853,7 @@ static bool copy_filtered_slot(struct nq_xlat_state *state,
         size_t len;
         const uint8_t *string = reader_string(reader, &len);
         if (*keep && string)
-            writer_bytes(writer, string, len);
+            writer_string(writer, string, len, NQ_LEGACY_SCOREBOARDNAME);
     } else {
         const uint8_t *p = reader_take(reader, remainder);
         if (*keep && p)
@@ -927,6 +954,12 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                     memcmp(string, download_extension, wire_len) == 0) {
                     keep = false;
                 } else if (string) {
+                    if (wire_len > NQ_LEGACY_STRING_WIRE_MAX) {
+                        set_error(error, error_size,
+                                  "stufftext exceeds legacy string limits");
+                        ok = false;
+                        break;
+                    }
                     writer_u8(&writer, command);
                     writer_bytes(&writer, string, wire_len);
                 }
@@ -950,7 +983,8 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
                 if (keep && string) {
                     writer_u8(&writer, command);
                     writer_u8(&writer, style);
-                    writer_bytes(&writer, string, string_len);
+                    writer_string(&writer, string, string_len,
+                                  NQ_LEGACY_STYLESTRING);
                 }
                 break;
             }

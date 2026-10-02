@@ -410,6 +410,192 @@ static bool test_unreliable_chunking(void)
     return true;
 }
 
+static bool test_legacy_string_limits(void)
+{
+    static const uint8_t commands[] = {8, 26, 31, 34, 13, 12};
+    static const size_t lengths[] = {
+        0, 30, 31, 32, 62, 63, 64, 2045, 2046, 2047, 4096
+    };
+    uint8_t input[4100];
+    size_t command_index;
+    size_t length_index;
+    unsigned int reliable;
+
+    for (command_index = 0; command_index < sizeof(commands); command_index++) {
+        uint8_t command = commands[command_index];
+        size_t prefix = command == 13 || command == 12 ? 2u : 1u;
+        size_t string_limit = command == 13 ? 32u :
+                              command == 12 ? 64u : 2047u;
+        for (length_index = 0;
+             length_index < sizeof(lengths) / sizeof(lengths[0]);
+             length_index++) {
+            size_t len = lengths[length_index];
+            input[0] = command;
+            if (prefix == 2)
+                input[1] = 0;
+            memset(input + prefix, 'a', len);
+            input[prefix + len] = 0;
+            input[prefix + len + 1] = 1; /* following svc_nop */
+            for (reliable = 0; reliable < 2; reliable++) {
+                struct nq_xlat_state state;
+                struct nq_batch batch;
+                char error[128];
+                size_t wire_len = len + 1;
+                size_t available = reliable ? 8192u - prefix : 1024u - prefix;
+                const struct nq_blob *last;
+
+                if (wire_len > string_limit)
+                    wire_len = string_limit;
+                if (wire_len > available)
+                    wire_len = available;
+                nq_xlat_init(&state, false);
+                nq_batch_init(&batch);
+                CHECK(nq_translate_server_message(&state, input,
+                          prefix + len + 2, reliable != 0, &batch,
+                          error, sizeof(error)));
+                CHECK(batch.count >= 1 && batch.count <= 2);
+                CHECK(batch.items[0].data[0] == command);
+                CHECK(memcmp(batch.items[0].data, input,
+                             prefix + wire_len - 1) == 0);
+                CHECK(batch.items[0].data[prefix + wire_len - 1] == 0);
+                CHECK(batch.items[0].len == prefix + wire_len +
+                      (batch.count == 1 ? 1u : 0u));
+                last = &batch.items[batch.count - 1];
+                CHECK(last->data[last->len - 1] == 1);
+                nq_batch_free(&batch);
+            }
+        }
+    }
+    return true;
+}
+
+static bool test_stufftext_string_limit(void)
+{
+    uint8_t input[2050];
+    size_t len;
+    for (len = 2046; len <= 2047; len++) {
+        struct nq_xlat_state state;
+        struct nq_batch batch;
+        char error[128];
+        input[0] = 9;
+        memset(input + 1, 'a', len);
+        input[len + 1] = 0;
+        input[len + 2] = 1;
+        nq_xlat_init(&state, false);
+        nq_batch_init(&batch);
+        if (len == 2046) {
+            CHECK(nq_translate_server_message(&state, input, len + 3,
+                      true, &batch, error, sizeof(error)));
+            CHECK(batch.count == 1 && batch.items[0].len == len + 3);
+            CHECK(memcmp(batch.items[0].data, input, len + 3) == 0);
+        } else {
+            CHECK(!nq_translate_server_message(&state, input, len + 3,
+                       true, &batch, error, sizeof(error)));
+            CHECK(batch.count == 0);
+            CHECK(strstr(error, "string limits") != NULL);
+        }
+        nq_batch_free(&batch);
+    }
+    return true;
+}
+
+static bool test_precache_path_limits(void)
+{
+    unsigned int resource;
+    size_t path_len;
+
+    for (resource = 0; resource < 2; resource++) {
+        for (path_len = 63; path_len <= 64; path_len++) {
+            uint8_t input[256];
+            uint8_t *p = input;
+            struct nq_xlat_state state;
+            struct nq_batch batch;
+            char error[128];
+            const uint8_t *out;
+
+            *p++ = 11;
+            put_u32(&p, 666);
+            *p++ = 4;
+            *p++ = 1;
+            put_string(&p, "Test");
+            put_string(&p, "maps/start.bsp");
+            if (resource == 1)
+                *p++ = 0; /* end models */
+            memset(p, 'a', path_len);
+            p += path_len;
+            *p++ = 0;
+            put_string(&p, "later");
+            *p++ = 0;
+            if (resource == 0)
+                *p++ = 0; /* empty sounds */
+            *p++ = 1; /* following svc_nop */
+
+            nq_xlat_init(&state, false);
+            nq_batch_init(&batch);
+            CHECK(nq_translate_server_message(&state, input,
+                      (size_t)(p - input), true, &batch, error, sizeof(error)));
+            CHECK(batch.count == 1);
+            CHECK(state.warned_limits == (path_len == 64));
+            CHECK(state.models_exposed ==
+                  (resource == 0 && path_len == 63 ? 4u : 2u));
+            CHECK(state.sounds_exposed ==
+                  (resource == 1 && path_len == 63 ? 3u : 1u));
+            out = batch.items[0].data;
+            out += 7 + strlen("Test") + 1 + strlen("maps/start.bsp") + 1;
+            if (resource == 1)
+                out++; /* end models */
+            if (path_len == 63) {
+                CHECK(strlen((const char *)out) == 63);
+                out += 64;
+                CHECK(!strcmp((const char *)out, "later"));
+            } else {
+                CHECK(*out == 0); /* hide the suffix without shifting indices */
+            }
+            CHECK(batch.items[0].data[batch.items[0].len - 1] == 1);
+            nq_batch_free(&batch);
+        }
+    }
+    return true;
+}
+
+static bool test_invalid_serverinfo_is_rejected(void)
+{
+    unsigned int scenario;
+    for (scenario = 0; scenario < 3; scenario++) {
+        uint8_t input[128];
+        uint8_t *p = input;
+        struct nq_xlat_state state;
+        struct nq_xlat_state original;
+        struct nq_batch batch;
+        char error[128];
+
+        *p++ = 11;
+        put_u32(&p, 666);
+        *p++ = scenario == 0 ? 0 : 4;
+        *p++ = 1;
+        put_string(&p, "Test");
+        if (scenario == 2) {
+            memset(p, 'a', 64); /* world path cannot fit MAX_QPATH */
+            p += 64;
+            *p++ = 0;
+        } else if (scenario == 0) {
+            put_string(&p, "maps/start.bsp");
+        }
+        *p++ = 0;
+        *p++ = 0;
+        nq_xlat_init(&state, false);
+        original = state;
+        nq_batch_init(&batch);
+        CHECK(!nq_translate_server_message(&state, input,
+                   (size_t)(p - input), true, &batch, error, sizeof(error)));
+        CHECK(!strncmp(error, "upstream ", 9));
+        CHECK(memcmp(&state, &original, sizeof(state)) == 0);
+        CHECK(batch.count == 0);
+        nq_batch_free(&batch);
+    }
+    return true;
+}
+
 struct capture {
     uint8_t packet[2048];
     size_t len;
@@ -456,6 +642,46 @@ static bool test_reliable_fragmentation(void)
     CHECK(nq_chan_receive(&sender, ack.packet, ack.len, 1.2, &message));
     CHECK(sender.queue_head == NULL && sender.queued_bytes == 0);
     nq_chan_destroy(&sender);
+    nq_chan_destroy(&receiver);
+    return true;
+}
+
+static bool test_reliable_sequence_validation(void)
+{
+    struct nq_chan receiver;
+    struct capture ack = {{0}, 0, 0};
+    struct nq_received_message message;
+    uint8_t packet[9];
+
+    nq_chan_init(&receiver, 1024, NQ_LEGACY_RELIABLE_MAX, capture_send, &ack);
+    put_be32(packet, NQ_NETFLAG_DATA | (uint32_t)sizeof(packet));
+    put_be32(packet + 4, 1); /* missing fragment zero: do not ACK */
+    packet[8] = 0x11;
+    CHECK(nq_chan_receive(&receiver, packet, sizeof(packet), 1.0, &message));
+    CHECK(message.kind == NQ_MESSAGE_NONE && ack.sends == 0);
+    put_be32(packet + 4, 0);
+    CHECK(nq_chan_receive(&receiver, packet, sizeof(packet), 1.1, &message));
+    CHECK(message.kind == NQ_MESSAGE_NONE && ack.sends == 1);
+    CHECK(nq_chan_receive(&receiver, packet, sizeof(packet), 1.2, &message));
+    CHECK(message.kind == NQ_MESSAGE_NONE && ack.sends == 2);
+    put_be32(packet, NQ_NETFLAG_DATA | NQ_NETFLAG_EOM |
+                     (uint32_t)sizeof(packet));
+    put_be32(packet + 4, 1);
+    packet[8] = 0x22;
+    CHECK(nq_chan_receive(&receiver, packet, sizeof(packet), 1.3, &message));
+    CHECK(message.kind == NQ_MESSAGE_RELIABLE && ack.sends == 3);
+    CHECK(message.len == 2 && message.data[0] == 0x11 && message.data[1] == 0x22);
+
+    receiver.receive_sequence = UINT32_MAX;
+    put_be32(packet + 4, UINT32_MAX);
+    CHECK(nq_chan_receive(&receiver, packet, sizeof(packet), 1.4, &message));
+    CHECK(message.kind == NQ_MESSAGE_RELIABLE && ack.sends == 4);
+    CHECK(receiver.receive_sequence == 0);
+    CHECK(nq_chan_receive(&receiver, packet, sizeof(packet), 1.5, &message));
+    CHECK(message.kind == NQ_MESSAGE_NONE && ack.sends == 5);
+    put_be32(packet + 4, 0);
+    CHECK(nq_chan_receive(&receiver, packet, sizeof(packet), 1.6, &message));
+    CHECK(message.kind == NQ_MESSAGE_RELIABLE && ack.sends == 6);
     nq_chan_destroy(&receiver);
     return true;
 }
@@ -684,7 +910,12 @@ int main(void)
         test_colormap_scoreboard_limit,
         test_lightstyle_limit,
         test_unreliable_chunking,
+        test_legacy_string_limits,
+        test_stufftext_string_limit,
+        test_precache_path_limits,
+        test_invalid_serverinfo_is_rejected,
         test_reliable_fragmentation,
+        test_reliable_sequence_validation,
         test_oversized_reliable_is_fully_discarded,
         test_maximum_reliable_message,
         test_legacy_reliable_message_limit,

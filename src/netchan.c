@@ -208,9 +208,13 @@ bool nq_chan_receive(struct nq_chan *chan, const uint8_t *packet,
         (flags & ~(NQ_NETFLAG_DATA | NQ_NETFLAG_EOM)) != 0)
         return false;
 
-    nq_chan_ack(chan, sequence);
-    if (sequence != chan->receive_sequence)
+    if (sequence != chan->receive_sequence) {
+        /* Re-ACK a retransmission, but never ACK an unreceived fragment. */
+        if (sequence == chan->receive_sequence - 1u)
+            nq_chan_ack(chan, sequence);
         return true;
+    }
+    nq_chan_ack(chan, sequence);
     chan->receive_sequence++;
 
     if (chan->receive_discarding) {

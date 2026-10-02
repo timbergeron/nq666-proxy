@@ -308,6 +308,22 @@ int main(void)
                                   &peer_len);
     CHECK(received >= 12 && packet[4] == 1);
 
+    /* A late connect retry must retain the pending upstream source port. */
+    {
+        struct sockaddr_in original_peer = upstream_peer;
+        CHECK(!wait_readable(server_fd, 2100000L));
+        CHECK(nq_socket_sendto(client_fd, packet, (size_t)received, 0,
+                               (struct sockaddr *)&proxy_address,
+                               (nq_socklen_t)sizeof(proxy_address)) == received);
+        peer_len = (nq_socklen_t)sizeof(upstream_peer);
+        received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                      (struct sockaddr *)&upstream_peer,
+                                      &peer_len);
+        CHECK(received >= 12 && packet[4] == 1);
+        CHECK(upstream_peer.sin_port == original_peer.sin_port);
+        CHECK(upstream_peer.sin_addr.s_addr == original_peer.sin_addr.s_addr);
+    }
+
     /* Reject an impossible game port, then allow a clean retry. */
     p = packet + 4;
     *p++ = 0x81;

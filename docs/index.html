@@ -1268,9 +1268,31 @@ sudo systemctl status nq666-proxy</code></pre>
                 <td class="limit">64</td>
                 <td>Higher style updates are omitted.</td>
               </tr>
+              <tr>
+                <td><strong>Player names</strong></td>
+                <td class="limit">31 characters</td>
+                <td>Longer names are truncated.</td>
+              </tr>
+              <tr>
+                <td><strong>Light-style patterns</strong></td>
+                <td class="limit">63 characters</td>
+                <td>Longer patterns are truncated.</td>
+              </tr>
+              <tr>
+                <td><strong>Model / sound paths</strong></td>
+                <td class="limit">63 characters</td>
+                <td>The precache list ends at the first unsupported path.</td>
+              </tr>
             </tbody>
           </table>
         </div>
+
+        <p class="section-intro" style="margin-top: 24px">
+          Display text is truncated to fit the legacy string reader and datagram
+          limits. Oversized console commands are rejected to avoid executing
+          partial commands. A missing or oversized world-model path, or a
+          zero-slot scoreboard, closes the connection with an incompatibility error.
+        </p>
 
         <div class="scope-grid" style="margin-top: 18px">
           <article class="scope-card">

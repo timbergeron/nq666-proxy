@@ -357,7 +357,8 @@ static void start_connection(struct proxy *proxy,
     }
 
     if (session) {
-        if (now - session->created_at < 2.0) {
+        if (session->phase == SESSION_PENDING ||
+            now - session->created_at < 2.0) {
             if (session->phase == SESSION_PENDING)
                 (void)nq_socket_send(session->upstream_fd,
                                      session->connect_request,
