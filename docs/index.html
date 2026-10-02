@@ -1415,11 +1415,15 @@ sudo systemctl status nq666-proxy</code></pre>
       });
 
       document.querySelectorAll('[data-copy]').forEach((button) => {
+        let resetTimer;
         button.addEventListener('click', async () => {
           const text = button.parentElement.querySelector('code').textContent;
+          let copied = false;
+          window.clearTimeout(resetTimer);
+          button.disabled = true;
           try {
             await navigator.clipboard.writeText(text);
-            button.textContent = 'Copied';
+            copied = true;
           } catch (_) {
             const field = document.createElement('textarea');
             field.value = text;
@@ -1427,12 +1431,20 @@ sudo systemctl status nq666-proxy</code></pre>
             field.style.position = 'fixed';
             field.style.opacity = '0';
             document.body.appendChild(field);
-            field.select();
-            document.execCommand('copy');
-            field.remove();
-            button.textContent = 'Copied';
+            try {
+              field.select();
+              copied = document.execCommand('copy');
+            } catch (_) {
+              copied = false;
+            } finally {
+              field.remove();
+            }
+            button.disabled = false;
+            button.focus({ preventScroll: true });
           }
-          window.setTimeout(() => { button.textContent = 'Copy'; }, 1600);
+          button.disabled = false;
+          button.textContent = copied ? 'Copied' : 'Copy failed';
+          resetTimer = window.setTimeout(() => { button.textContent = 'Copy'; }, 1600);
         });
       });
     })();

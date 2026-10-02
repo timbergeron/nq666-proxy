@@ -871,6 +871,7 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
     struct nq_xlat_state next_state = *state;
     size_t chunk_limit = reliable ? NQ_LEGACY_RELIABLE_MAX :
                                     NQ_LEGACY_DATAGRAM_MAX;
+    bool disconnect = false;
 
     if (error && error_size)
         error[0] = 0;
@@ -888,12 +889,15 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
         } else {
             switch (command) {
             case SVC_NOP:
-            case SVC_DISCONNECT:
             case SVC_KILLEDMONSTER:
             case SVC_FOUNDSECRET:
             case SVC_INTERMISSION:
             case SVC_SELLSCREEN:
                 writer_u8(&writer, command);
+                break;
+            case SVC_DISCONNECT:
+                writer_u8(&writer, command);
+                disconnect = true;
                 break;
             case SVC_UPDATESTAT: {
                 uint8_t stat = reader_u8(&reader);
@@ -1100,7 +1104,10 @@ bool nq_translate_server_message(struct nq_xlat_state *state,
             return false;
         }
         writer_free(&writer);
+        if (disconnect)
+            break;
     }
+    output->disconnect = disconnect;
     *state = next_state;
     return true;
 }
@@ -1112,6 +1119,7 @@ bool nq_translate_client_message(const struct nq_xlat_state *state,
 {
     struct reader reader = {input, input_len, 0, false};
     size_t chunk_limit = reliable ? NQ_UPSTREAM_RELIABLE_MAX : 1442u;
+    bool disconnect = false;
 
     if (error && error_size)
         error[0] = 0;
@@ -1124,7 +1132,9 @@ bool nq_translate_client_message(const struct nq_xlat_state *state,
         writer_u8(&writer, command);
         switch (command) {
         case CLC_NOP:
+            break;
         case CLC_DISCONNECT:
+            disconnect = true;
             break;
         case CLC_STRINGCMD: {
             static const uint8_t plain_pext[] = {'p', 'e', 'x', 't', 0};
@@ -1169,6 +1179,9 @@ bool nq_translate_client_message(const struct nq_xlat_state *state,
             return false;
         }
         writer_free(&writer);
+        if (disconnect)
+            break;
     }
+    output->disconnect = disconnect;
     return true;
 }

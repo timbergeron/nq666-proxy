@@ -22,6 +22,7 @@ struct nq_batch {
     struct nq_blob *items;
     size_t count;
     size_t capacity;
+    bool disconnect; /* A parsed disconnect terminates the message. */
 };
 
 struct nq_xlat_state {

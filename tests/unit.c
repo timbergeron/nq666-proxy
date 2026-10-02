@@ -686,6 +686,69 @@ static bool test_reliable_sequence_validation(void)
     return true;
 }
 
+static bool test_unreliable_sequence_wraparound(void)
+{
+    struct nq_chan receiver;
+    struct capture ack = {{0}, 0, 0};
+    struct nq_received_message message;
+    uint8_t packet[9];
+    static const uint32_t sequences[] = {
+        UINT32_MAX - 1u, UINT32_MAX - 1u, 0, UINT32_MAX, 1, 1
+    };
+    static const bool accepted[] = {true, false, true, false, true, false};
+    size_t i;
+
+    nq_chan_init(&receiver, 1024, NQ_LEGACY_RELIABLE_MAX, capture_send, &ack);
+    receiver.unreliable_receive_sequence = UINT32_MAX - 1u;
+    put_be32(packet, NQ_NETFLAG_UNRELIABLE | (uint32_t)sizeof(packet));
+    packet[8] = 1;
+    for (i = 0; i < sizeof(sequences) / sizeof(sequences[0]); i++) {
+        put_be32(packet + 4, sequences[i]);
+        CHECK(nq_chan_receive(&receiver, packet, sizeof(packet), 1.0, &message));
+        CHECK(message.kind == (accepted[i] ? NQ_MESSAGE_UNRELIABLE :
+                                            NQ_MESSAGE_NONE));
+    }
+    CHECK(receiver.unreliable_receive_sequence == 2);
+    CHECK(ack.sends == 0);
+    nq_chan_destroy(&receiver);
+    return true;
+}
+
+static bool test_disconnect_commands(void)
+{
+    unsigned int server;
+    unsigned int disconnect;
+    unsigned int reliable;
+    for (server = 0; server < 2; server++) {
+        for (disconnect = 0; disconnect < 2; disconnect++) {
+            for (reliable = 0; reliable < 2; reliable++) {
+                uint8_t input[] = {0, 'x', 2, 0, 1, 2, 0xff};
+                size_t input_len = disconnect ? sizeof(input) : 5u;
+                struct nq_xlat_state state;
+                struct nq_batch batch;
+                char error[128];
+                bool ok;
+
+                input[0] = server ? 8 : 4; /* print or stringcmd */
+                nq_xlat_init(&state, false);
+                nq_batch_init(&batch);
+                ok = server ? nq_translate_server_message(&state, input,
+                         input_len, reliable != 0, &batch, error, sizeof(error)) :
+                              nq_translate_client_message(&state, input,
+                         input_len, reliable != 0, &batch, error, sizeof(error));
+                CHECK(ok);
+                CHECK(batch.disconnect == (disconnect != 0));
+                CHECK(batch.count == 1);
+                CHECK(batch.items[0].len == (disconnect ? 6u : 5u));
+                CHECK(memcmp(batch.items[0].data, input,
+                             batch.items[0].len) == 0);
+                nq_batch_free(&batch);
+            }
+        }
+    }
+    return true;
+}
+
 static bool test_oversized_reliable_is_fully_discarded(void)
 {
     static uint8_t first[40008];
@@ -916,6 +979,8 @@ int main(void)
         test_invalid_serverinfo_is_rejected,
         test_reliable_fragmentation,
         test_reliable_sequence_validation,
+        test_unreliable_sequence_wraparound,
+        test_disconnect_commands,
         test_oversized_reliable_is_fully_discarded,
         test_maximum_reliable_message,
         test_legacy_reliable_message_limit,

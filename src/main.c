@@ -23,6 +23,7 @@
 #define SESSION_TIMEOUT 300.0
 #define HANDSHAKE_TIMEOUT 8.0
 #define QUERY_TIMEOUT 3.0
+#define DISCONNECT_TIMEOUT 8.0
 #define TRANSLATION_ERROR_WINDOW 30.0
 #define TRANSLATION_ERROR_LIMIT 5
 #define MAX_ADVERTISE 256
@@ -47,6 +48,7 @@ enum session_phase {
     SESSION_FREE = 0,
     SESSION_PENDING,
     SESSION_ACTIVE,
+    SESSION_DRAINING,
     SESSION_QUERY
 };
 
@@ -72,6 +74,8 @@ struct session {
     size_t accept_reply_len;
     double created_at;
     double last_activity;
+    double disconnect_at;
+    bool client_started;
     double last_translation_error;
     unsigned int translation_errors;
     unsigned int limit_warning_generation;
@@ -250,6 +254,10 @@ static void session_close(struct session *session)
 {
     if (session->phase == SESSION_FREE)
         return;
+    if (session->phase == SESSION_ACTIVE) {
+        uint8_t disconnect = CLC_DISCONNECT;
+        (void)nq_chan_send_unreliable(&session->upstream_chan, &disconnect, 1);
+    }
     nq_chan_destroy(&session->client_chan);
     nq_chan_destroy(&session->upstream_chan);
     if (session->upstream_fd != NQ_INVALID_SOCKET)
@@ -265,7 +273,8 @@ static struct session *find_client_session(struct proxy *proxy,
     for (i = 0; i < proxy->max_sessions; i++) {
         struct session *session = &proxy->sessions[i];
         if ((session->phase == SESSION_PENDING ||
-             session->phase == SESSION_ACTIVE) &&
+             session->phase == SESSION_ACTIVE ||
+             session->phase == SESSION_DRAINING) &&
             same_address(&session->client_address, client))
             return session;
     }
@@ -357,8 +366,12 @@ static void start_connection(struct proxy *proxy,
     }
 
     if (session) {
-        if (session->phase == SESSION_PENDING ||
-            now - session->created_at < 2.0) {
+        bool same_request = packet_len == session->connect_request_len &&
+            memcmp(packet, session->connect_request, packet_len) == 0;
+        if (same_request &&
+            (session->phase == SESSION_PENDING ||
+             (session->phase == SESSION_ACTIVE &&
+              (!session->client_started || now - session->created_at < 2.0)))) {
             if (session->phase == SESSION_PENDING)
                 (void)nq_socket_send(session->upstream_fd,
                                      session->connect_request,
@@ -370,11 +383,6 @@ static void start_connection(struct proxy *proxy,
                                        (const struct sockaddr *)client,
                                        (nq_socklen_t)sizeof(*client));
             return;
-        }
-        if (session->phase == SESSION_ACTIVE) {
-            uint8_t disconnect = CLC_DISCONNECT;
-            (void)nq_chan_send_unreliable(&session->upstream_chan,
-                                          &disconnect, 1);
         }
         session_close(session);
     }
@@ -673,6 +681,8 @@ static void translate_client_packet(struct session *session,
                                sizeof(address)), error);
         if (record_translation_error(session, now, 1))
             close_reason = "too many invalid client messages";
+    } else if (batch.disconnect) {
+        session_close(session);
     } else if (!forward_batch(&session->upstream_chan, &batch, reliable, now)) {
         close_reason = reliable ? "send queue to upstream is full" :
                                   "could not send datagram upstream";
@@ -706,6 +716,14 @@ static void translate_server_packet(struct session *session,
     } else if (!forward_batch(&session->client_chan, &batch, reliable, now)) {
         close_reason = reliable ? "send queue to client is full" :
                                   "could not send datagram to client";
+    } else if (batch.disconnect) {
+        if (reliable) {
+            session->phase = SESSION_DRAINING;
+            session->disconnect_at = now;
+        } else {
+            session->phase = SESSION_DRAINING;
+            session_close(session);
+        }
     } else if (!queue_limit_warning(session, now)) {
         close_reason = "send queue to client is full";
     }
@@ -720,13 +738,19 @@ static void handle_frontend_game(struct proxy *proxy,
                                  double now)
 {
     struct nq_received_message message;
-    session->last_activity = now;
     if (!nq_chan_receive(&session->client_chan, packet, packet_len,
                          now, &message)) {
         if (proxy->verbose)
             fprintf(stderr, "malformed legacy datagram dropped\n");
         return;
     }
+    session->last_activity = now;
+    if (session->phase == SESSION_DRAINING) {
+        if (!session->client_chan.queued_bytes)
+            session_close(session);
+        return;
+    }
+    session->client_started = true;
     if (message.kind != NQ_MESSAGE_NONE)
         translate_client_packet(session, &message, now);
 }
@@ -737,7 +761,6 @@ static void handle_active_upstream(struct proxy *proxy,
                                    double now)
 {
     struct nq_received_message message;
-    session->last_activity = now;
     if (nq_packet_is_control(packet, packet_len))
         return;
     if (!nq_chan_receive(&session->upstream_chan, packet, packet_len,
@@ -746,7 +769,8 @@ static void handle_active_upstream(struct proxy *proxy,
             fprintf(stderr, "malformed upstream datagram dropped\n");
         return;
     }
-    if (message.kind != NQ_MESSAGE_NONE)
+    session->last_activity = now;
+    if (session->phase == SESSION_ACTIVE && message.kind != NQ_MESSAGE_NONE)
         translate_server_packet(session, &message, now);
 }
 
@@ -779,7 +803,8 @@ static void receive_frontend(struct proxy *proxy, double now)
             continue;
         }
         session = find_client_session(proxy, &client);
-        if (session && session->phase == SESSION_ACTIVE)
+        if (session && (session->phase == SESSION_ACTIVE ||
+                        session->phase == SESSION_DRAINING))
             handle_frontend_game(proxy, session, packet,
                                  (size_t)received, now);
     }
@@ -797,8 +822,19 @@ static void receive_upstream(struct proxy *proxy, struct session *session,
         int received = nq_socket_recv(session->upstream_fd, packet,
                                       sizeof(packet), 0);
         if (received < 0) {
-            if (nq_socket_error_would_block(nq_socket_last_error()))
+            if (nq_socket_error_would_block(nq_socket_last_error()) ||
+                nq_socket_error_interrupted(nq_socket_last_error()))
                 return;
+            /* The server may close its port before the client ACKs disconnect. */
+            if (session->phase == SESSION_DRAINING)
+                return;
+            if (session->phase == SESSION_PENDING)
+                send_control_reject(proxy, &session->client_address,
+                                    "Proxy could not reach upstream.\n");
+            else if (session->phase == SESSION_ACTIVE) {
+                notify_client_and_close(session, "upstream connection failed");
+                return;
+            }
             session_close(session);
             return;
         }
@@ -820,7 +856,8 @@ static void receive_upstream(struct proxy *proxy, struct session *session,
                     (const struct sockaddr *)&session->client_address,
                     (nq_socklen_t)sizeof(session->client_address));
             session_close(session);
-        } else if (session->phase == SESSION_ACTIVE) {
+        } else if (session->phase == SESSION_ACTIVE ||
+                   session->phase == SESSION_DRAINING) {
             handle_active_upstream(proxy, session, packet,
                                    (size_t)received, now);
         }
@@ -837,6 +874,14 @@ static void pump_and_expire(struct proxy *proxy, double now)
         double timeout;
         if (session->phase == SESSION_FREE)
             continue;
+        if (session->phase == SESSION_DRAINING) {
+            if (!session->client_chan.queued_bytes ||
+                now - session->disconnect_at > DISCONNECT_TIMEOUT)
+                session_close(session);
+            else
+                nq_chan_pump(&session->client_chan, now);
+            continue;
+        }
         timeout = session->phase == SESSION_QUERY ? QUERY_TIMEOUT :
                   session->phase == SESSION_PENDING ? HANDSHAKE_TIMEOUT :
                   SESSION_TIMEOUT;

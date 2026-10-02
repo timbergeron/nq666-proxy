@@ -68,6 +68,8 @@ unreliable message splitting, and the reliable UDP fragment/ACK sequence. The
 integration target starts the real proxy process between a fake protocol-15
 client and protocol-666 server and checks query rewriting, handshake rejection,
 sanitized `pext` negotiation, ACKs, and translated sign-on.
+It also checks lost handshake replies, disconnect retransmission, and session
+slot reuse with a one-session proxy.
 
 ## Run
 
@@ -177,6 +179,9 @@ deliberately outside this proxy's scope.
 The proxy supports IPv4, matching the original clients. Each legacy client is
 given a separate upstream UDP socket and protocol state. Idle sessions expire
 after five minutes.
+Client disconnects release their slots immediately. Reliable server disconnects
+remain queued until acknowledged, with an eight-second cleanup deadline. The
+proxy notifies QSS-M when it closes an active session, including during shutdown.
 
 ## Operational notes
 

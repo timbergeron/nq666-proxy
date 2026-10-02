@@ -105,6 +105,7 @@ static nq_process_t start_proxy(const char *program, const char *server,
 {
     return _spawnl(_P_NOWAIT, program, "nq666-proxy", "--server", server,
                    "--listen", listen, "--advertise", advertise,
+                   "--max-sessions", "1",
                    (char *)NULL);
 }
 
@@ -127,6 +128,7 @@ static nq_process_t start_proxy(const char *program, const char *server,
     if (process == 0) {
         execl(program, "nq666-proxy", "--server", server,
               "--listen", listen, "--advertise", advertise,
+              "--max-sessions", "1",
               (char *)NULL);
         _exit(127);
     }
@@ -168,6 +170,25 @@ static void make_unreliable(uint8_t *packet, size_t *packet_len,
     memcpy(packet + 8, payload, payload_len);
 }
 
+static void make_connect_request(uint8_t *packet, size_t *packet_len)
+{
+    uint8_t *p = packet + 4;
+    *p++ = 1;
+    put_string(&p, "QUAKE");
+    *p++ = 3;
+    *packet_len = (size_t)(p - packet);
+    put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)*packet_len);
+}
+
+static void make_accept_reply(uint8_t *packet, size_t *packet_len, uint16_t port)
+{
+    uint8_t *p = packet + 4;
+    *p++ = 0x81;
+    put_le32(&p, port);
+    *packet_len = (size_t)(p - packet);
+    put_be32(packet, NQ_NETFLAG_CTL | (uint32_t)*packet_len);
+}
+
 int main(void)
 {
     uint16_t server_port = 0;
@@ -176,6 +197,8 @@ int main(void)
     nq_socket_t server_fd = NQ_INVALID_SOCKET;
     nq_socket_t reservation_fd = NQ_INVALID_SOCKET;
     nq_socket_t client_fd = NQ_INVALID_SOCKET;
+    nq_socket_t other_client_fd = NQ_INVALID_SOCKET;
+    nq_socket_t game_fd = NQ_INVALID_SOCKET;
     nq_process_t proxy_process = (nq_process_t)-1;
     int result = 1;
     struct sockaddr_in proxy_address;
@@ -368,6 +391,17 @@ int main(void)
     CHECK(received == 10 && packet[4] == 0x81 && packet[9] == 1);
     CHECK((uint16_t)(packet[5] | ((uint16_t)packet[6] << 8)) == proxy_port);
 
+    /* Losing the accept reply must not restart an accepted connection. */
+    CHECK(!wait_readable(server_fd, 2100000L));
+    make_connect_request(packet, &packet_len);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == (int)packet_len);
+    received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(received == 10 && packet[4] == 0x81 && packet[9] == 1);
+    CHECK((uint16_t)(packet[5] | ((uint16_t)packet[6] << 8)) == proxy_port);
+    CHECK(!wait_readable(server_fd, 100000L));
+
     /* ProQuake's mod byte alone enables its 16-bit client angles. */
     memset(payload, 0, 19);
     payload[0] = 3;
@@ -469,6 +503,135 @@ int main(void)
                            (struct sockaddr *)&proxy_address,
                            (nq_socklen_t)sizeof(proxy_address));
 
+    /* Client disconnects release the only slot and notify the upstream. */
+    payload[0] = 2;
+    make_unreliable(packet, &packet_len, 1, payload, 1);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == (int)packet_len);
+    do {
+        received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                      (struct sockaddr *)&upstream_peer,
+                                      &peer_len);
+        CHECK(received >= 8);
+    } while ((get_be32(packet) & ~NQ_NETFLAG_LENGTH_MASK) == NQ_NETFLAG_ACK);
+    CHECK(received == 9 && packet[8] == 2);
+    CHECK((get_be32(packet) & ~NQ_NETFLAG_LENGTH_MASK) == NQ_NETFLAG_UNRELIABLE);
+
+    other_client_fd = bind_loopback(&unused_port);
+    CHECK(other_client_fd != NQ_INVALID_SOCKET);
+    make_connect_request(packet, &packet_len);
+    CHECK(nq_socket_sendto(other_client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == (int)packet_len);
+    received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                  (struct sockaddr *)&upstream_peer, &peer_len);
+    CHECK(received == 12 && packet[4] == 1);
+    make_accept_reply(packet, &packet_len, server_port);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) == (int)packet_len);
+    received = nq_socket_recv(other_client_fd, packet, sizeof(packet), 0);
+    CHECK(received == 9 && packet[4] == 0x81);
+
+    /* Reliable disconnects survive a lost ACK before releasing the slot. */
+    p = payload;
+    *p++ = 8;
+    put_string(&p, "Goodbye\n");
+    *p++ = 2;
+    make_reliable(packet, &packet_len, 0, payload, (size_t)(p - payload));
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) == (int)packet_len);
+    received = nq_socket_recv(server_fd, packet, sizeof(packet), 0);
+    CHECK(received == 8 && (get_be32(packet) & NQ_NETFLAG_ACK) != 0);
+    /* Re-ACK an upstream retry while the legacy disconnect is draining. */
+    make_reliable(packet, &packet_len, 0, payload, (size_t)(p - payload));
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) == (int)packet_len);
+    received = nq_socket_recv(server_fd, packet, sizeof(packet), 0);
+    CHECK(received == 8 && (get_be32(packet) & NQ_NETFLAG_ACK) != 0);
+    CHECK(get_be32(packet + 4) == 0);
+    received = nq_socket_recv(other_client_fd, packet, sizeof(packet), 0);
+    CHECK(received == (int)(8 + (size_t)(p - payload)));
+    CHECK((get_be32(packet) & NQ_NETFLAG_DATA) != 0 && get_be32(packet + 4) == 0);
+    CHECK(memcmp(packet + 8, payload, (size_t)(p - payload)) == 0);
+    CHECK(wait_readable(other_client_fd, 1500000L));
+    received = nq_socket_recv(other_client_fd, packet, sizeof(packet), 0);
+    CHECK(received == (int)(8 + (size_t)(p - payload)));
+    CHECK((get_be32(packet) & NQ_NETFLAG_DATA) != 0 && get_be32(packet + 4) == 0);
+    CHECK(memcmp(packet + 8, payload, (size_t)(p - payload)) == 0);
+    make_ack(packet, 0);
+    CHECK(nq_socket_sendto(other_client_fd, packet, 8, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == 8);
+
+    make_connect_request(packet, &packet_len);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == (int)packet_len);
+    received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                  (struct sockaddr *)&upstream_peer, &peer_len);
+    CHECK(received == 12 && packet[4] == 1);
+    make_accept_reply(packet, &packet_len, server_port);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) == (int)packet_len);
+    received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(received == 9 && packet[4] == 0x81);
+
+    /* Unreliable server disconnects release the slot immediately. */
+    payload[0] = 2;
+    make_unreliable(packet, &packet_len, 0, payload, 1);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) == (int)packet_len);
+    received = nq_socket_recv(client_fd, packet, sizeof(packet), 0);
+    CHECK(received == 9 && packet[8] == 2);
+    make_connect_request(packet, &packet_len);
+    CHECK(nq_socket_sendto(other_client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == (int)packet_len);
+    received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                  (struct sockaddr *)&upstream_peer, &peer_len);
+    CHECK(received == 12 && packet[4] == 1);
+
+    /* Closing the upstream game port must not cancel disconnect retries. */
+    game_fd = bind_loopback(&unused_port);
+    CHECK(game_fd != NQ_INVALID_SOCKET);
+    make_accept_reply(packet, &packet_len, unused_port);
+    CHECK(nq_socket_sendto(server_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) == (int)packet_len);
+    received = nq_socket_recv(other_client_fd, packet, sizeof(packet), 0);
+    CHECK(received == 9 && packet[4] == 0x81);
+    payload[0] = 2;
+    make_reliable(packet, &packet_len, 0, payload, 1);
+    CHECK(nq_socket_sendto(game_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&upstream_peer,
+                           (nq_socklen_t)sizeof(upstream_peer)) == (int)packet_len);
+    (void)nq_close_socket(game_fd);
+    game_fd = NQ_INVALID_SOCKET;
+    received = nq_socket_recv(other_client_fd, packet, sizeof(packet), 0);
+    CHECK(received == 9 && packet[8] == 2);
+    CHECK((get_be32(packet) & NQ_NETFLAG_DATA) != 0 && get_be32(packet + 4) == 0);
+    CHECK(wait_readable(other_client_fd, 1500000L));
+    received = nq_socket_recv(other_client_fd, packet, sizeof(packet), 0);
+    CHECK(received == 9 && packet[8] == 2);
+    CHECK((get_be32(packet) & NQ_NETFLAG_DATA) != 0 && get_be32(packet + 4) == 0);
+    make_ack(packet, 0);
+    CHECK(nq_socket_sendto(other_client_fd, packet, 8, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == 8);
+    make_connect_request(packet, &packet_len);
+    CHECK(nq_socket_sendto(client_fd, packet, packet_len, 0,
+                           (struct sockaddr *)&proxy_address,
+                           (nq_socklen_t)sizeof(proxy_address)) == (int)packet_len);
+    received = nq_socket_recvfrom(server_fd, packet, sizeof(packet), 0,
+                                  (struct sockaddr *)&upstream_peer, &peer_len);
+    CHECK(received == 12 && packet[4] == 1);
+
     result = 0;
     printf("process integration test passed\n");
 
@@ -477,6 +640,10 @@ cleanup:
         stop_proxy(proxy_process);
     if (client_fd != NQ_INVALID_SOCKET)
         (void)nq_close_socket(client_fd);
+    if (other_client_fd != NQ_INVALID_SOCKET)
+        (void)nq_close_socket(other_client_fd);
+    if (game_fd != NQ_INVALID_SOCKET)
+        (void)nq_close_socket(game_fd);
     if (reservation_fd != NQ_INVALID_SOCKET)
         (void)nq_close_socket(reservation_fd);
     if (server_fd != NQ_INVALID_SOCKET)

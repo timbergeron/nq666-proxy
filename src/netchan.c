@@ -195,7 +195,8 @@ bool nq_chan_receive(struct nq_chan *chan, const uint8_t *packet,
     if (flags & NQ_NETFLAG_UNRELIABLE) {
         if (flags != NQ_NETFLAG_UNRELIABLE)
             return false;
-        if (sequence < chan->unreliable_receive_sequence)
+        /* Compare sequence numbers across uint32_t wraparound. */
+        if (sequence - chan->unreliable_receive_sequence >= UINT32_C(0x80000000))
             return true;
         chan->unreliable_receive_sequence = sequence + 1;
         message->kind = NQ_MESSAGE_UNRELIABLE;
